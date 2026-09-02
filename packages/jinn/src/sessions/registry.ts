@@ -6,6 +6,7 @@ import { initDb } from '../shared/db.js';
 import { stripControlChars } from '../shared/sanitize.js';
 import { getMeta, setMeta, canonicalCallbackIdentityText, canonicalSessionDeliveryIdentity, sessionDeliveryFromRow, validateSessionDeliveryIdentity, type SessionDeliveryRow } from './migrate.js';
 import { parseTodoId } from '../work-items/id.js';
+import { toWorkItemLinkRole } from '../work-items/link-role.js';
 import type { ChatBlock, ChatBlockEnvelope, EngineSessionRef, EngineSessionRefs, JsonObject, ReplyContext, Session, SessionAttemptOutcome, SessionDelivery, SessionDeliveryIdentity, SessionDeliveryPayload, WorkflowAttemptInterruptionCause, WorkflowSessionProvenance } from '../shared/types.js';
 import { blockFallbackText, mergeBlock, validateBlockEnvelope } from '../shared/blocks.js';
 import { ptySnapshotStore } from '../engines/pty-snapshot.js';
@@ -126,6 +127,7 @@ function rowToSession(row: Record<string, unknown>): Session {
     connector,
     sessionKey,
     workItemId: (row.work_item_id as string) ?? null,
+    workItemRole: (row.work_item_role as string) ? toWorkItemLinkRole(row.work_item_role) : null,
     replyContext: replyContext as ReplyContext | null,
     messageId: (row.message_id as string) ?? null,
     transportMeta,

@@ -699,6 +699,21 @@ export function remoteSessionHome(facts: RemoteFacts, jinnSessionId: string): st
   return path.posix.join(facts.stageDir, SESSIONS_DIR, safeSessionSegment(jinnSessionId));
 }
 
+/**
+ * The instance's own `bin/` as a remote session sees it: a symlink in the farm
+ * pointing at the mounted gateway home's `bin/`.
+ *
+ * Put on the session's PATH so the tools the operating instructions name by
+ * bare name — `mem` above all — actually resolve there. Without it a remote
+ * employee is told to run `~/.jinn/bin/mem`, finds no `~/.jinn` on that host
+ * (the farm is deliberately NOT called `.jinn`), and concludes the memory layer
+ * does not exist for them: three review rounds on DAH-213 recorded nothing
+ * (DAH-214 item 3).
+ */
+export function remoteSessionBinDir(facts: RemoteFacts, jinnSessionId: string): string {
+  return path.posix.join(remoteSessionHome(facts, jinnSessionId), "bin");
+}
+
 /** Session ids are gateway-generated and already path-safe; this is here so a
  *  hand-crafted one can never walk out of the sessions directory. */
 function safeSessionSegment(jinnSessionId: string): string {

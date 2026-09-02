@@ -1,6 +1,7 @@
 import { latestHumanStatusMoveAt } from './event-log.js';
 import { closeWorkItemRun, findOpenWorkItemRunBySession, runOutcomeForReceipt } from './runs.js';
 import { listSessionsByWorkItem } from '../sessions/registry.js';
+import { isExecutionAttempt } from './link-role.js';
 import { logger } from '../shared/logger.js';
 import type { Session, SessionAttemptOutcome } from '../shared/types.js';
 
@@ -93,7 +94,7 @@ export function collectAttemptEvidence(workItemId: string): WorkItemAttemptReadi
   // `in_review` (and TRUST-closed to `done`) with four phases still to run, and
   // `in_review` is not re-derivable, so it would stay wrong for the rest of the
   // run. Same rule the `source === 'workflow'` guard states for items.
-  const sessions = listSessionsByWorkItem(workItemId).filter((s) => s.workflowProvenance?.kind !== 'phase');
+  const sessions = listSessionsByWorkItem(workItemId).filter(isExecutionAttempt);
   closeRunsForSettledAttempts(sessions);
   const humanDecisionAt = latestHumanStatusMoveAt(workItemId);
   return {

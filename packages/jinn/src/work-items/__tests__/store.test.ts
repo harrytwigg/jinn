@@ -308,7 +308,7 @@ describe("work-item store — events (append-only audit)", () => {
     store.linkSession(wi.id, "sess-evt-link"); // idempotent — no second event
     const linkEvents = store.listWorkItemEvents(wi.id).filter((e) => e.kind === "session_linked");
     expect(linkEvents).toHaveLength(1);
-    expect(linkEvents[0].detail).toEqual({ sessionId: "sess-evt-link" });
+    expect(linkEvents[0].detail).toEqual({ sessionId: "sess-evt-link", role: "execute" });
   });
 
   it("listWorkItemEvents returns oldest-first and tolerates corrupt detail JSON", () => {

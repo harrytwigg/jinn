@@ -232,6 +232,18 @@ describe("InteractiveClaudeEngine — remote branch", () => {
       expect(cmd).toContain(`JINN_SESSION_ID='${SID}'`);
     });
 
+    // DAH-214 item 3. The instance's own bin/ reaches a remote session only
+    // through the farm, and the operating instructions call `mem` by name. Off
+    // PATH, a reviewer on another host looks for `~/.jinn/bin/mem`, finds no
+    // `~/.jinn` there at all (the farm is deliberately named otherwise), and
+    // concludes the company has no memory layer — three review rounds recorded
+    // nothing that way.
+    it("puts the instance's own bin/ on the remote PATH, after the node directory", async () => {
+      await startRemoteTurn();
+      const cmd = remoteCommandOf(hoisted.spawns[0].args);
+      expect(cmd).toContain(`PATH='/usr/bin':'${REMOTE_HOME}/bin':"$PATH"`);
+    });
+
     it("never wakes the host from a spawn path", async () => {
       await startRemoteTurn();
       expect(hoisted.ensureCalls[0].opts.allowWake).toBe(false);

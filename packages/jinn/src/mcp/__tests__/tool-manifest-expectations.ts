@@ -164,6 +164,7 @@ export const EXPECTED_ENUMS = {
   create_work_item: [["properties.priority", [0, 1, 2, 3]]],
   decide_workflow_approval: [["properties.decision", ["approve", "reject"]]],
   decide_work_item_approval: [["properties.decision", ["approve", "reject"]]],
+  delegate_task: [["properties.intent", ["execute", "review"]]],
   edit_work_item: [["properties.priority", [0, 1, 2, 3]]],
   get_workflow_run: [["properties.view", ["full"]]],
   link_work_items: [["properties.kind", ["blocks", "relates", "duplicates"]]],

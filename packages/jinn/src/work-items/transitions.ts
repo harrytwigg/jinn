@@ -1,4 +1,5 @@
 import { listSessionsByWorkItem } from '../sessions/registry.js';
+import { isExecutionAttempt } from './link-role.js';
 import { initDb } from '../shared/db.js';
 import { clearBlockRecord, DEFAULT_BLOCK_KIND, recordBlock, resolveBlock, type BlockKind } from './blocks.js';
 import { cascadeCloseDescendants } from './cascade.js';
@@ -182,7 +183,7 @@ export function transition(id: string, to: WorkItemStatus, actor: string, opts: 
     }
     if (to === 'done' && opts.callerSessionId) {
       const linked = listSessionsByWorkItem(id);
-      if (linked.some((s) => s.id === opts.callerSessionId && s.workflowProvenance?.kind !== 'phase')) {
+      if (linked.some((s) => s.id === opts.callerSessionId && isExecutionAttempt(s))) {
         throw new TransitionError(
           'self-review-banned',
           `session ${opts.callerSessionId} executed work item ${id} and cannot mark it done — a reviewer does (self-review ban)`,
