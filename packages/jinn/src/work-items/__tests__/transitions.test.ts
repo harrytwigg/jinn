@@ -152,6 +152,16 @@ describe("transition — the guarded edge map", () => {
 
     const { item } = tr.transition(phaseItem.id, "done", "reviewer", { callerSessionId: phase.id });
     expect(item.status).toBe("done");
+
+    // DAH-214 item 1: so can a session linked for REVIEW. It was delegated the
+    // review of work it did not produce, and closing that work is the whole
+    // point of it being there.
+    const reviewedItem = mk("in_review");
+    const reviewer = registry.createSession({ engine: "claude", source: "web", sourceRef: "review-attempt" });
+    store.linkSession(reviewedItem.id, reviewer.id, null, "review");
+
+    const reviewed = tr.transition(reviewedItem.id, "done", "reviewer", { callerSessionId: reviewer.id });
+    expect(reviewed.item.status).toBe("done");
   });
 
   it("fires the registered todo-status-change listener with the committed event id after a status change", () => {

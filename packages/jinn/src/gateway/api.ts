@@ -183,6 +183,7 @@ import {
   type WorkItemSource,
   type WorkItemStatus,
 } from "../work-items/store.js";
+import { resolveDelegationLinkRole, WORK_ITEM_LINK_ROLES, type WorkItemLinkRole } from "../work-items/link-role.js";
 import { validateVerifyPolicy } from "../work-items/verify-policy.js";
 import { resolveTodoEditAuthority, todoEditRefusal } from "./todo-edit-authority.js";
 import { isTodoId, resolveTodoIdPrefix } from "../work-items/id.js";
@@ -3725,6 +3726,17 @@ export async function handleApiRequest(
       // work-item table with garbage intent records.
       const task = typeof body.task === "string" && body.task.trim() ? (body.task as string) : undefined;
       if (!task) return badRequest(res, "task is required — the full brief for the delegate");
+      // WHY this session is being linked, when the caller says so. Left unsaid,
+      // the Todo's own status decides (see resolveDelegationLinkRole): a Todo
+      // already in `in_review` is being handed to a reviewer, and a reviewer
+      // linked as its producer is refused the close (DAH-214 item 1).
+      let intent: WorkItemLinkRole | undefined;
+      if (body.intent !== undefined && body.intent !== null) {
+        if (typeof body.intent !== "string" || !WORK_ITEM_LINK_ROLES.includes(body.intent.trim() as WorkItemLinkRole)) {
+          return badRequest(res, `intent must be one of ${WORK_ITEM_LINK_ROLES.join(", ")} when provided`);
+        }
+        intent = body.intent.trim() as WorkItemLinkRole;
+      }
       const employeeName = typeof body.employee === "string" && body.employee.trim() ? (body.employee as string).trim() : undefined;
       const engineParam = typeof body.engine === "string" && body.engine.trim() ? (body.engine as string).trim() : undefined;
       if (!employeeName && !engineParam) {
@@ -3936,7 +3948,7 @@ export async function handleApiRequest(
       //    preserved ids (backlog item + idle, undispatched, re-linkable session)
       //    instead of dispatching an untracked turn.
       try {
-        linkSession(workItem.id, session.id, delegationActor);
+        linkSession(workItem.id, session.id, delegationActor, resolveDelegationLinkRole(intent, workItem.status));
         claim.bind(session.id);
       } catch (linkErr) {
         claim.release();

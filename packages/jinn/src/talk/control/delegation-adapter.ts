@@ -12,6 +12,7 @@ import type { Session } from "../../shared/types.js";
 import { assignWorkItem } from "../../work-items/assignment.js";
 import { reconcileWorkItem } from "../../work-items/reconcile.js";
 import { getWorkItem, linkSession } from "../../work-items/store.js";
+import { resolveDelegationLinkRole } from "../../work-items/link-role.js";
 import type { TalkControlAdapterContext, TalkControlExecution } from "./types.js";
 
 interface DelegateEmployee {
@@ -83,7 +84,8 @@ export function claimTalkDelegation(input: TalkDelegationInput): ClaimedDelegati
       prompt: input.prompt,
       title: `Delegate ${input.todoId}`,
     });
-    linkSession(input.todoId, session.id);
+    // Handing an `in_review` Todo to someone is handing it to a reviewer.
+    linkSession(input.todoId, session.id, null, resolveDelegationLinkRole(undefined, assigned.status));
     const turn = claimIncomingTurn({
       sessionId: session.id,
       sessionKey: key,

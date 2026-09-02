@@ -345,6 +345,10 @@ export interface WorkflowSessionExecutor {
 }
 
 /** Durable attribution for a workflow-owned employee attempt session. */
+/** Why a session is linked to a Todo: it executed it, or it was delegated its
+ *  review. The predicates that read it live in work-items/link-role.ts. */
+export type WorkItemLinkRole = "execute" | "review";
+
 export interface WorkflowSessionProvenance {
   kind: "phase";
   workflowId: string;
@@ -387,6 +391,10 @@ export interface Session {
    * transcript remain durable and searchable until explicitly unarchived. */
   archivedAt?: string | null;
   parentSessionId: string | null;
+  /** Why this session is linked to `workItemId`: `execute` (it is an execution
+   *  attempt) or `review` (it was delegated the review of one). Null/undefined
+   *  reads as `execute`. See work-items/link-role.ts. */
+  workItemRole?: WorkItemLinkRole | null;
   /** Explicit workflow/run/phase attribution for grouping and filtered reads. */
   workflowProvenance?: WorkflowSessionProvenance | null;
   /** Forwarded SSO identity captured from an auth proxy (opt-in via

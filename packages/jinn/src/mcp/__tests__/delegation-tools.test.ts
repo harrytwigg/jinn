@@ -75,7 +75,7 @@ describe("delegate_task — registry + schema", () => {
       if (name !== "attachments") expect(prop.type).toBe("string");
     }
     expect(Object.keys(t.inputSchema.properties).sort()).toEqual(
-      ["attachments", "effortLevel", "employee", "engine", "idempotencyKey", "model", "task", "title", "workItemId"].sort(),
+      ["attachments", "effortLevel", "employee", "engine", "idempotencyKey", "intent", "model", "task", "title", "workItemId"].sort(),
     );
   });
 

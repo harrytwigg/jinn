@@ -317,6 +317,11 @@ export function migrateSessionsSchema(database: Database.Database): void {
     // Work-item link (GRS-002). Nullable; NULL = unchanged legacy behavior. The
     // partial index idx_sessions_work_item is created in initDb.
     ['work_item_id', 'TEXT'],
+    // WHY the session is linked to that Todo: 'execute' (the producer) or
+    // 'review' (a reviewer delegated onto it). NULL is 'execute', so every
+    // pre-existing link keeps exactly the meaning it had. Read by the
+    // self-review ban and the status derivation — see work-items/link-role.ts.
+    ['work_item_role', 'TEXT'],
     // Explicit latest-attempt receipt. NULL means no successful/failed terminal
     // engine result has been recorded; `idle` by itself is not completion proof.
     ['attempt_outcome', 'TEXT'],
