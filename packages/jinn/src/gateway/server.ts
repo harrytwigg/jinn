@@ -644,7 +644,14 @@ export async function startGateway(
     onCleanup: () => refreshPtyPids(),
   });
   const hermesInteractiveEngine = new HermesInteractiveEngine(hermesLifecycle);
-  const piEngine = new PiEngine();
+  const piEngine = new PiEngine({
+    // Same two live readers the interactive engine takes, and for the same
+    // reason: pi is the second engine that can relocate a turn over SSH, so a
+    // remote employee running on pi needs the `remote` block and the port the
+    // reverse tunnel forwards to.
+    remote: () => currentConfig.remote,
+    gatewayPort: () => port,
+  });
   logger.info("Engines initialized: claude (interactive PTY), codex (headless + interactive PTY), antigravity (headless + interactive PTY), grok (headless + interactive PTY), hermes (headless + interactive PTY), pi");
 
   const codexEngine = new CodexEngine();

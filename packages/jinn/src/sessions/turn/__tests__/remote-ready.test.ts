@@ -83,6 +83,20 @@ describe("ensureRemoteHostReady", () => {
     expect(res.error).toContain("no remote support");
   });
 
+  it("lets a remote-capable engine through, and asks the host about that engine's own CLI", async () => {
+    // Pi is the second engine that can relocate a turn. Refusing it here would
+    // have made a remote Pi employee unusable; asking the host about `claude`
+    // on its behalf would refuse a desktop that has no Claude Code on it and
+    // never needed any.
+    const { ensureRemoteReady } = await import("../../../engines/remote-stage.js");
+    expect(await ensureRemoteHostReady(input(), "pi")).toEqual({ ok: true });
+    expect(ensureRemoteReady).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ engine: "pi" }),
+    );
+  });
+
   it("does not start the turn when a stop lands between the last probe and the restore", async () => {
     // `shouldAbort` covers the wait itself but cannot cover this window. The
     // restore is fenced on `waiting`, so it simply fails — and ignoring that
