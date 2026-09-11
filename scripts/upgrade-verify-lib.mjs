@@ -4,6 +4,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { spawn, spawnSync } from "node:child_process"
+import { signalGatewayGroup, stopGatewayGroup } from "./upgrade-verify-process-group.mjs"
 
 export const NONCE_FILE = ".jinn-upgrade-verify-nonce"
 export const PROTECTED_PORTS = new Set([7777, 7801])
@@ -29,10 +30,27 @@ export function createDisposableRoot() {
   return fs.realpathSync(root)
 }
 
-export function removeDisposableRoot(root) {
+export async function removeDisposableRoot(root) {
   const resolved = fs.realpathSync(root)
-  if (!fs.existsSync(path.join(resolved, NONCE_FILE))) throw new Error(`refusing cleanup without ${NONCE_FILE}: ${resolved}`)
-  fs.rmSync(resolved, { recursive: true })
+  const marker = path.join(resolved, NONCE_FILE)
+  if (!fs.existsSync(marker) || !fs.lstatSync(marker).isFile()) throw new Error(`refusing cleanup without ${NONCE_FILE}: ${resolved}`)
+  const nonce = fs.readFileSync(marker)
+  // Engine CLI writers can outlive the gateway. Keep the ownership proof out of
+  // recursive removal so an exhausted retry still leaves a cleanable root.
+  for (let attempt = 0; ; attempt++) {
+    for (const name of fs.readdirSync(resolved).filter((name) => name !== NONCE_FILE)) {
+      await fs.promises.rm(path.join(resolved, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    }
+    fs.unlinkSync(marker)
+    try {
+      await fs.promises.rmdir(resolved)
+      return
+    } catch (error) {
+      fs.writeFileSync(marker, nonce, { mode: 0o600, flag: "wx" })
+      if (error.code !== "ENOTEMPTY" || attempt >= 5) throw error
+      await sleep((attempt + 1) * 100)
+    }
+  }
 }
 
 export function deriveScenarioPort(root, scenario) {
@@ -77,7 +95,7 @@ export function buildEnvironment(root, scenario, port) {
     XDG_DATA_HOME: path.join(scenarioRoot, "xdg", "data"),
     npm_config_prefix: prefix,
     npm_config_cache: path.join(scenarioRoot, "cache"),
-    npm_config_ignore_scripts: "true",
+    npm_config_ignore_scripts: "false",
     npm_config_audit: "false",
     npm_config_fund: "false",
     JINN_NO_OPEN: "1",
@@ -102,15 +120,14 @@ export function latestPublishedTarball(root, env) {
 
 export function installTarball(tarball, prefix, env) {
   fs.mkdirSync(prefix, { recursive: true })
-  run("npm", ["install", "--global", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund", tarball], {
+  // The v0.33.0 gate skipped node-pty's Linux source build. Exercise every
+  // dependency's normal lifecycle instead of maintaining a native rebuild list.
+  run("npm", ["install", "--global", "--prefix", prefix, "--ignore-scripts=false", "--no-audit", "--no-fund", tarball], {
     env: { ...env, npm_config_prefix: prefix },
   })
   const packageRoot = path.join(prefix, "lib", "node_modules", "jinn-cli")
   const cli = path.join(packageRoot, "dist", "bin", "jinn.js")
   if (!fs.existsSync(cli)) throw new Error(`installed package has no CLI: ${cli}`)
-  run("npm", ["rebuild", "better-sqlite3", "--prefix", packageRoot, "--ignore-scripts=false", "--foreground-scripts"], {
-    env: { ...env, npm_config_prefix: prefix, npm_config_ignore_scripts: "false" },
-  })
   const version = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version
   if (!STRICT_VERSION.test(version)) throw new Error(`installed package has an invalid version: ${String(version)}`)
   return { packageRoot, cli, version }
@@ -230,8 +247,9 @@ export async function startGateway(cli, layout, port, label) {
     cwd: layout.env.HOME,
     env: layout.env,
     stdio: ["ignore", log, log],
+    detached: process.platform !== "win32",
   })
-  const handle = { child, log, logPath, port }
+  const handle = { child, log, logPath, port, processGroup: process.platform !== "win32" }
   try {
     await waitForGateway(handle, label)
     return handle
@@ -249,7 +267,8 @@ export async function stopGateway(handle) {
     while (!exited() && Date.now() < deadline) await sleep(50)
   }
   if (!exited()) {
-    handle.child.kill("SIGTERM")
+    if (handle.processGroup) signalGatewayGroup(handle, "SIGTERM")
+    else handle.child.kill("SIGTERM")
     await wait(5_000)
   }
   if (!exited()) {
@@ -257,5 +276,6 @@ export async function stopGateway(handle) {
     await wait(5_000)
   }
   if (!exited()) throw new Error(`upgrade-verifier PID ${handle.child.pid} survived SIGKILL`)
+  if (handle.processGroup) await stopGatewayGroup(handle)
   fs.closeSync(handle.log)
 }

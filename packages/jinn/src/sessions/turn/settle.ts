@@ -72,7 +72,7 @@ export async function settleAnsweredTurn(
 
   const displayText = quietPreempted ? "" : turnDisplayText(result.result, result.error);
   if (shouldPersistFinalAssistantMessage({ resultText: result.result, quietPreempted }) || displayText) {
-    insertMessageAfter(sessionId, "assistant", displayText, verdict.streamedThrough);
+    insertMessageAfter(sessionId, "assistant", displayText, verdict.streamedThrough, undefined, undefined, answeredMessageMeta(run, attempt));
   }
 
   const settled = await settleTurn({
@@ -90,6 +90,14 @@ export async function settleAnsweredTurn(
     (result.durationMs ? ` in ${result.durationMs}ms` : "") +
     (result.cost ? ` ($${result.cost.toFixed(4)})` : ""),
   );
+}
+
+function answeredMessageMeta(run: TurnRun, attempt: EngineAttempt) {
+  return {
+    assistantPhase: "final",
+    turnStartedAt: run.turnStartedAt,
+    turnOutcome: attempt.result.error ? "error" : "complete",
+  };
 }
 
 /**

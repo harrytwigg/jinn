@@ -1,3 +1,4 @@
+export { resumePendingWebQueueItems } from "./callback-queue-recovery.js";
 import type { IncomingMessage as HttpRequest, ServerResponse } from "node:http";
 import http from "node:http";
 import crypto from "node:crypto";
@@ -23,7 +24,6 @@ import { withEngineHealth } from "../shared/engine-health.js";
 import { validateNewSessionSelection, validateSessionPatch } from "../sessions/session-patch.js";
 import { buildDelegatedActivityIndex } from "../sessions/delegated-activity.js";
 import { maybeRevertEngineOverride, type SessionManager } from "../sessions/manager.js";
-import { runtimeSessionSource } from "../sessions/context.js";
 import { stripControlChars, hasControlBytes } from "../shared/sanitize.js";
 import { CONNECTOR_ID_REQUIREMENTS, isValidConnectorId } from "../shared/connector-id.js";
 import { initDb } from "../shared/db.js";
@@ -62,11 +62,10 @@ import {
   getMessages,
   getMessagePage,
   enqueueQueueItem,
-  cancelQueueItem,
   markRunningQueueItemsCompletedForSession,
-  listAllPendingQueueItems,
+  shouldHoldParentCompletionQueueDispatch,
+  listReleasableParentCompletionQueuesForSource,
   getSessionDelivery,
-  getSessionDeliveryByQueueItemId,
   listDeadLetterSessionDeliveries,
   requeueDeadLetterSessionDelivery,
   acceptSessionDelivery,
@@ -417,55 +416,6 @@ function preserveLinkedAttempt(
     : session;
   if (session.workItemId) reconcileWorkItem(session.workItemId);
   return preserved;
-}
-
-export function resumePendingWebQueueItems(context: ApiContext): void {
-  const pending = listAllPendingQueueItems();
-  if (pending.length === 0) return;
-
-  let resumed = 0;
-  for (const item of pending) {
-    let session = getSession(item.sessionId);
-    if (!session) {
-      cancelQueueItem(item.id);
-      continue;
-    }
-    // Ordinary non-web queue ownership remains connector-specific. Callback
-    // receipts are the exception: acceptance already committed this internal
-    // turn, so startup replay must finish it regardless of the parent's source.
-    const callbackDelivery = getSessionDeliveryByQueueItemId(item.id);
-    if (runtimeSessionSource(session.source) !== "web" && !callbackDelivery) continue;
-    // Hot-reload calls this too: a row waiting its turn here is owned, not orphaned.
-    if (context.sessionManager.getQueue().hasInFlightItem(item.id)) continue;
-    session = maybeRevertEngineOverride(session);
-
-    const engine = context.sessionManager.getEngine(session.engine);
-    if (!engine) {
-      const diagnostic = `Engine "${session.engine}" not available`;
-      if (callbackDelivery) {
-        // Acceptance committed this exact queue row as part of the callback
-        // outbox. Engine availability is transient operational state, not a
-        // reason to destroy that accepted intent. Keep the row pending so a
-        // later config/engine reload can replay the same durable ID.
-        updateSession(session.id, { lastActivity: new Date().toISOString(), lastError: diagnostic });
-        logger.warn(`Deferred accepted callback queue ${item.id}: ${diagnostic}`);
-      } else {
-        cancelQueueItem(item.id);
-        updateSession(session.id, { status: "error", lastActivity: new Date().toISOString(), lastError: diagnostic });
-      }
-      continue;
-    }
-
-    // Ensure the session is in a runnable state
-    updateSession(session.id, { status: "running", lastActivity: new Date().toISOString(), lastError: null });
-
-    dispatchWebSessionRun(session, item.prompt, engine, context, { queueItemId: item.id });
-    resumed++;
-  }
-
-  if (resumed > 0) {
-    logger.info(`Re-dispatched ${resumed} pending web queue item(s) after gateway restart`);
-  }
 }
 
 /** Find managed attachment IDs that have no registry row or readable file. */
@@ -4366,6 +4316,7 @@ export async function handleApiRequest(
       // still sees it. User messages retain their existing enqueue point below.
       let queueItemId: string | undefined;
       let incomingMessageId: string;
+      let callbackQueueNeedsDispatch = true;
       if (callbackDelivery) {
         const acceptance = acceptSessionDelivery(callbackDelivery.id, session.id, sessionKey);
         if (!acceptance.accepted) {
@@ -4379,6 +4330,22 @@ export async function handleApiRequest(
         }
         queueItemId = acceptance.delivery.queueItemId!;
         incomingMessageId = acceptance.delivery.messageId!;
+        // A completion accepted into an already-owned pending batch only updates
+        // that row's engine-facing payload. Enqueuing the alias would add a
+        // second promise-chain slot for the same durable work. An orphaned batch
+        // (for example after restart) is not owned and still needs dispatch.
+        const queue = context.sessionManager.getQueue();
+        if (shouldHoldParentCompletionQueueDispatch(queueItemId)) {
+          queue.holdForCallbackDrain(sessionKey, queueItemId);
+        } else {
+          queue.releaseCallbackDrain(sessionKey, queueItemId);
+        }
+        if (callbackDelivery.sourceKind === "session") {
+          for (const held of listReleasableParentCompletionQueuesForSource(callbackDelivery.sourceId)) {
+            queue.releaseCallbackDrain(held.sessionKey, held.queueItemId);
+          }
+        }
+        callbackQueueNeedsDispatch = !queue.hasInFlightItem(queueItemId);
       } else {
         const claim = claimIncomingTurn({
           sessionId: session.id, sessionKey, prompt, isNotification, role: messageRole, dedupeKey: lateralDedupeKey,
@@ -4510,7 +4477,9 @@ export async function handleApiRequest(
         context.emit("queue:updated", { sessionId: session.id, sessionKey });
       }
 
-      dispatchWebSessionRun(session, enginePrompt, engine, context, { queueItemId, attachments: attachmentPaths.length > 0 ? attachmentPaths : undefined });
+      if (!callbackDelivery || callbackQueueNeedsDispatch) {
+        dispatchWebSessionRun(session, enginePrompt, engine, context, { queueItemId, attachments: attachmentPaths.length > 0 ? attachmentPaths : undefined });
+      }
 
       return json(res, {
         status: "queued",
