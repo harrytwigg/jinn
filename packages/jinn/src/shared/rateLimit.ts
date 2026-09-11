@@ -23,6 +23,8 @@ const RATE_LIMIT_ENGINE_LABELS: Record<string, string> = {
   grok: "Grok",
   pi: "Pi",
   hermes: "Hermes",
+  // Lowercase on purpose: it is how the project spells its own name.
+  opencode: "opencode",
 };
 
 /** Human-facing provider/engine name for rate-limit state and notifications. */

@@ -4,7 +4,7 @@ import yaml from "js-yaml";
 import { resolveJinnHome } from "../shared/paths.js";
 import type { Employee, JinnConfig } from "../shared/types.js";
 import { logger } from "../shared/logger.js";
-import { getModelRegistry, effortLevelsForModel } from "../shared/models.js";
+import { getModelRegistry, effortLevelsForModel, hasDynamicModelCatalog } from "../shared/models.js";
 import { validateRemoteTarget } from "../shared/remote-target.js";
 import {
   isSystemEmployeeName,
@@ -283,9 +283,9 @@ export function validateEmployeeUpdate(
     const modelId = body.model.trim();
     const entry = registry[resultingEngine];
     if (entry && !entry.models.some((m) => m.id === modelId)) {
-      if (resultingEngine === "pi") {
-        // Pi models are discovered dynamically; tolerate an id the snapshot hasn't caught yet.
-        logger.warn(`pi model "${modelId}" not in discovered set yet — allowing`);
+      if (hasDynamicModelCatalog(resultingEngine)) {
+        // Discovered-only catalog; tolerate an id the snapshot hasn't caught yet.
+        logger.warn(`${resultingEngine} model "${modelId}" not in discovered set yet — allowing`);
       } else {
         const known = entry.models.map((m) => m.id).join(", ");
         return { ok: false, error: `unknown model "${modelId}" for engine "${resultingEngine}" (known: ${known || "none"})` };

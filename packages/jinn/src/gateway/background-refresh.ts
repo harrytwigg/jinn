@@ -20,6 +20,7 @@ import {
   refreshGrokModels,
   refreshHermesModels,
   refreshPiModels,
+  refreshOpencodeModels,
 } from "../shared/models.js";
 
 /**
@@ -56,6 +57,7 @@ export function startBackgroundRefreshes(getConfig: () => JinnConfig, emit: Gate
       refreshCodexModels(config),
       refreshAntigravityModels(config),
       refreshPiModels(config),
+      refreshOpencodeModels(config),
       refreshGrokModels(config),
       refreshHermesModels(config),
     ])

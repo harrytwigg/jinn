@@ -40,6 +40,7 @@ vi.mock("node:dgram", () => {
   return { default: { createSocket }, createSocket };
 });
 
+import { REMOTE_ENGINE_NAMES } from "../../shared/models.js";
 import { shq, buildSshSpawnArgs, sendWakeOnLan, FACTS_SCRIPT, FARM_SCRIPT, buildTrustSeedCommand, trustSeedKey, runLocalWakeCommand, requireRemoteEngineBin, remoteSessionHome, remoteSessionBinDir, buildSessionEnvFile } from "../remote-stage.js";
 import { remotePiExtensionSource } from "../pi-mcp.js";
 import { JINN_HOME } from "../../shared/paths.js";
@@ -414,8 +415,13 @@ describe.skipIf(process.platform === "win32")("FACTS_SCRIPT node resolution", ()
     fs.writeFileSync(pi, "#!/bin/sh\nexit 0\n");
     fs.chmodSync(pi, 0o755);
 
+    const opencode = path.join(binDir, "opencode");
+    fs.writeFileSync(opencode, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(opencode, 0o755);
+
     const kv = runFacts(`${binDir}:/usr/bin:/bin`);
     expect(kv.pi).toBe(pi);
+    expect(kv.opencode).toBe(opencode);
     expect(kv.claude).toBe("");
   });
 
@@ -660,12 +666,13 @@ describe("remoteSessionHome — per session AND per engine", () => {
     entryDir: "/usr/lib/jinn/dist/src/mcp",
   };
 
-  it("gives two engines on one session two different homes", () => {
-    const claude = remoteSessionHome(FACTS, "sess-1", "claude");
-    const pi = remoteSessionHome(FACTS, "sess-1", "pi");
-    expect(claude).not.toBe(pi);
-    // …and therefore two different gateway.json files, which is the whole point.
-    expect(path.posix.dirname(claude)).toBe(path.posix.dirname(pi));
+  it("gives every engine on one session its own home", () => {
+    const homes = REMOTE_ENGINE_NAMES.map((engine) => remoteSessionHome(FACTS, "sess-1", engine));
+    // …and therefore its own gateway.json, which is the whole point: a session
+    // substituted onto another engine must not restage the home the engine it
+    // came from is still reading out of.
+    expect(new Set(homes).size).toBe(REMOTE_ENGINE_NAMES.length);
+    expect(new Set(homes.map((h) => path.posix.dirname(h))).size).toBe(1);
   });
 
   it("keeps each home a single directory under sessions/, where the reaper looks", () => {
@@ -752,10 +759,23 @@ describe("requireRemoteEngineBin", () => {
     expect(requireRemoteEngineBin("build-box", FACTS, "pi")).toBe("/usr/local/bin/pi");
     expect(requireRemoteEngineBin("build-box", { ...FACTS, claudeBin: "/usr/local/bin/claude" }, "claude"))
       .toBe("/usr/local/bin/claude");
+    expect(requireRemoteEngineBin("build-box", { ...FACTS, opencodeBin: "/usr/local/bin/opencode" }, "opencode"))
+      .toBe("/usr/local/bin/opencode");
   });
 
-  it("does not refuse a Pi host for having no Claude Code on it", () => {
+  it("does not refuse a Pi host for having no Claude Code or opencode on it", () => {
     expect(() => requireRemoteEngineBin("build-box", FACTS, "pi")).not.toThrow();
+  });
+
+  it("names the missing binary for every engine that can run remotely", () => {
+    // The map from engine to facts field is the thing under test: a fourth
+    // engine wired into one reader and not the other would report a host as
+    // having nothing installed on it.
+    for (const engine of REMOTE_ENGINE_NAMES) {
+      if (engine === "pi") continue;
+      expect(() => requireRemoteEngineBin("build-box", FACTS, engine))
+        .toThrow(new RegExp(`build-box has no \\\`${engine}\\\``));
+    }
   });
 
   it("names the host, the binary and how to check the PATH when one is missing", () => {

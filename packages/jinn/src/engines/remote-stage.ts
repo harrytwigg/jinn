@@ -16,6 +16,7 @@ import type { RemoteEngineName } from "../shared/models.js";
 import type { RemoteExecutionConfig } from "../shared/config-types.js";
 import { remapMcpConfigForRemote } from "../mcp/remote-config.js";
 import { piJinnMcpAttachable, piJinnSessionEnv, remotePiExtensionSource } from "./pi-mcp.js";
+import { buildOpencodeSessionConfig, serializeOpencodeSessionConfig } from "./opencode-mcp.js";
 
 /**
  * Everything the gateway does to a remote host that is NOT the interactive
@@ -189,6 +190,7 @@ export interface RemoteFacts {
    *  host that runs Pi employees has no reason to have Claude Code installed. */
   claudeBin?: string;
   piBin?: string;
+  opencodeBin?: string;
   jinnVersion: string;
   /** Directory holding the remote install's `server-entry.js` / `scrub-entry.js`. */
   entryDir: string;
@@ -234,6 +236,7 @@ printf 'home=%s\\n' "$HOME"
 printf 'node=%s\\n' "$(command -v node 2>/dev/null || true)"
 printf 'claude=%s\\n' "$(command -v claude 2>/dev/null || true)"
 printf 'pi=%s\\n' "$(command -v pi 2>/dev/null || true)"
+printf 'opencode=%s\\n' "$(command -v opencode 2>/dev/null || true)"
 jinnbin=$(command -v jinn 2>/dev/null || true)
 if [ -n "$jinnbin" ]; then
   printf 'jinnversion=%s\\n' "$(jinn --version 2>/dev/null | tr -d '\\r' | head -n 1)"
@@ -276,8 +279,18 @@ export function clearRemoteFactsCache(): void {
 export function remoteEngineAvailable(destination: string, engine: RemoteEngineName): boolean | undefined {
   const facts = factsCache.get(destination);
   if (!facts) return undefined;
-  return Boolean(engine === "claude" ? facts.claudeBin : facts.piBin);
+  return Boolean(facts[REMOTE_ENGINE_BIN_FIELD[engine]]);
 }
+
+/** Which {@link RemoteFacts} field holds each engine's CLI path. One map rather
+ *  than a ternary at each call site: a fourth engine that has to add a branch to
+ *  two separate conditionals is how the two quietly stop agreeing about what is
+ *  installed on a host. */
+const REMOTE_ENGINE_BIN_FIELD: Record<RemoteEngineName, "claudeBin" | "piBin" | "opencodeBin"> = {
+  claude: "claudeBin",
+  pi: "piBin",
+  opencode: "opencodeBin",
+};
 
 /** Facts already learned about a host this gateway boot, without asking again.
  *  For callers on a hot path that must never make an ssh round trip — the hook
@@ -321,6 +334,7 @@ function assertRemoteToolchain(destination: string, kv: Record<string, string>):
 const REMOTE_ENGINE_INSTALL_HINT: Record<RemoteEngineName, string> = {
   claude: "install Claude Code there and sign it in",
   pi: "install the Pi CLI there and configure its providers in ~/.pi/agent/models.json",
+  opencode: "install the opencode CLI there and sign it in with `opencode auth login`",
 };
 
 /**
@@ -331,12 +345,19 @@ const REMOTE_ENGINE_INSTALL_HINT: Record<RemoteEngineName, string> = {
  * value — an unattended turn that fails with "no such file" tells the operator
  * nothing about which machine, which binary, or which PATH.
  */
+/** The path to `engine`'s CLI on that host, or undefined when the probe did not
+ *  find one. For callers that want to REPORT the state rather than act on it —
+ *  `jinn remote status`, whose whole job is to say what is and is not there. */
+export function remoteEngineBin(facts: RemoteFacts, engine: RemoteEngineName): string | undefined {
+  return facts[REMOTE_ENGINE_BIN_FIELD[engine]];
+}
+
 export function requireRemoteEngineBin(
   destination: string,
   facts: RemoteFacts,
   engine: RemoteEngineName,
 ): string {
-  const bin = engine === "claude" ? facts.claudeBin : facts.piBin;
+  const bin = remoteEngineBin(facts, engine);
   if (bin) return bin;
   throw new Error(
     `${destination} has no \`${engine}\` on the non-interactive PATH. Check with `
@@ -380,6 +401,7 @@ async function gatherFacts(destination: string): Promise<RemoteFacts> {
     nodeBin: kv.node,
     ...(kv.claude ? { claudeBin: kv.claude } : {}),
     ...(kv.pi ? { piBin: kv.pi } : {}),
+    ...(kv.opencode ? { opencodeBin: kv.opencode } : {}),
     jinnVersion: kv.jinnversion,
     entryDir: kv.entrydir,
   };
@@ -1067,7 +1089,22 @@ export interface RemotePiStaging extends RemoteSessionStagingBase {
   piExtensionPath?: string;
 }
 
-export type RemoteSessionStaging = RemoteClaudeStaging | RemotePiStaging;
+export interface RemoteOpencodeStaging extends RemoteSessionStagingBase {
+  engine: "opencode";
+  /** Remote path for `OPENCODE_CONFIG`, when this session has MCP servers
+   *  opencode can run. Undefined when it carries none — opencode's own config on
+   *  that host is then left entirely alone, which is the same condition the
+   *  local path treats as "run without the belt".
+   *
+   *  Note what is NOT staged: opencode's data directory. Its session store and
+   *  its `auth.json` sit side by side under the remote user's home, so moving
+   *  the store would take the login with it and every turn would start
+   *  unauthenticated. opencode generates its own session ids, so sessions
+   *  sharing that one store cannot collide the way pi's would. */
+  opencodeConfigPath?: string;
+}
+
+export type RemoteSessionStaging = RemoteClaudeStaging | RemotePiStaging | RemoteOpencodeStaging;
 
 /**
  * Stage everything one remote session needs and return the remote paths its
@@ -1079,6 +1116,7 @@ export type RemoteSessionStaging = RemoteClaudeStaging | RemotePiStaging;
  */
 export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts & { engine: "claude" }): Promise<RemoteClaudeStaging>;
 export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts & { engine: "pi" }): Promise<RemotePiStaging>;
+export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts & { engine: "opencode" }): Promise<RemoteOpencodeStaging>;
 export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts): Promise<RemoteSessionStaging> {
   const { target, remote, facts, jinnSessionId, engine } = opts;
   assertRemoteTarget(target, remote);
@@ -1115,6 +1153,11 @@ export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts): Prom
     const piSessionDir = await stagePiSessionDir(destination, sessionHome);
     const piExtensionPath = await stagePiExtension(destination, facts, sessionHome, jinnSessionId, opts.resolvedMcp);
     return { ...base, engine, piSessionDir, ...(piExtensionPath ? { piExtensionPath } : {}) };
+  }
+
+  if (engine === "opencode") {
+    const opencodeConfigPath = await stageOpencodeConfig(destination, facts, sessionHome, tunnelPort, opts.resolvedMcp);
+    return { ...base, engine, ...(opencodeConfigPath ? { opencodeConfigPath } : {}) };
   }
 
   const settingsPath = await stageSettings(destination, facts, sessionHome, jinnSessionId);
@@ -1256,6 +1299,40 @@ async function stagePiSessionDir(destination: string, sessionHome: string): Prom
     throw new Error(`could not create the remote pi session dir ${dir} on ${destination}: ${res.stderr.trim() || `exit ${res.code}`}`);
   }
   return dir;
+}
+
+/**
+ * Stage the `OPENCODE_CONFIG` file carrying this session's toolset.
+ *
+ * The cheapest wiring of the three engines, because opencode reads a real MCP
+ * config: the already-resolved set is re-pointed at the remote install exactly
+ * as Claude's is, then projected into opencode's own `mcp` shape. Nothing about
+ * the servers themselves changes — same node, same entry scripts, same bearer
+ * out of `<JINN_HOME>/gateway.json` over the same reverse tunnel.
+ *
+ * 0600, because the projected `environment` carries this session's capability:
+ * anything on a remote command line is readable by every process on that host,
+ * and this file is how it stays off one.
+ */
+async function stageOpencodeConfig(
+  destination: string,
+  facts: RemoteFacts,
+  sessionHome: string,
+  tunnelPort: number,
+  resolvedMcp: ResolvedMcpConfig | undefined,
+): Promise<string | undefined> {
+  if (!resolvedMcp || Object.keys(resolvedMcp.mcpServers ?? {}).length === 0) return undefined;
+  const remapped = remapMcpConfigForRemote(resolvedMcp, {
+    remoteNode: facts.nodeBin,
+    remoteEntryDir: facts.entryDir,
+    remoteHome: sessionHome,
+    gatewayUrl: `http://127.0.0.1:${tunnelPort}`,
+  });
+  const config = buildOpencodeSessionConfig(remapped);
+  if (!config) return undefined;
+  const configPath = path.posix.join(sessionHome, "tmp", "opencode.json");
+  await stageRemoteFile(destination, configPath, serializeOpencodeSessionConfig(config));
+  return configPath;
 }
 
 /**

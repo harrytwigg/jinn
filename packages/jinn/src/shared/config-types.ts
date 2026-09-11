@@ -100,6 +100,10 @@ export interface JinnConfig {
     pi?: { bin?: string; model?: string; effortLevel?: string; childEffortOverride?: string; fallback?: EngineName[] ; fallbackModelMap?: Record<string, string> };
     /** Hermes (`hermes` CLI) engine. `bin` optional — PATH-resolved. No effort. */
     hermes?: { bin?: string; model?: string; fallback?: EngineName[] ; fallbackModelMap?: Record<string, string> };
+    /** opencode (`opencode` CLI) engine. `bin` optional — PATH-resolved. `model`
+     *  is opencode's own `provider/model` form. No effort: `--variant` is
+     *  provider-specific and opencode reports no list to validate against. */
+    opencode?: { bin?: string; model?: string; fallback?: EngineName[] ; fallbackModelMap?: Record<string, string> };
   };
   /** Optional model + capability registry. When absent, synthesized from engines.<name>.model. */
   models?: ModelsConfig;

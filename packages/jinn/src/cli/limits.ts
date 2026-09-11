@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { loadConfig } from "../shared/config.js";
 import { JINN_HOME } from "../shared/paths.js";
 import { collectEngineLimits } from "../shared/engine-limits.js";
-import { refreshGrokModels, refreshPiModels, refreshHermesModels } from "../shared/models.js";
+import { refreshGrokModels, refreshPiModels, refreshHermesModels, refreshOpencodeModels } from "../shared/models.js";
 import type { EngineLimitEngineSnapshot, EngineLimitWindow } from "../shared/types.js";
 
 export interface LimitsOptions {
@@ -83,6 +83,7 @@ export async function runLimits(opts: LimitsOptions = {}): Promise<void> {
 
   const config = loadConfig();
   await refreshPiModels(config);
+  await refreshOpencodeModels(config);
   await refreshGrokModels(config);
   await refreshHermesModels(config);
   const snapshot = await collectEngineLimits(config, { engine: opts.engine });
