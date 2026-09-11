@@ -25,10 +25,11 @@
 
 import type { RateLimitHandlerOpts, RateLimitOutcome } from "./rate-limit-contract.js";
 import type { RemoteTarget } from "../shared/types.js";
-import { isRemoteTarget } from "../shared/remote-target.js";
+import { isRemoteTarget, sshDestination } from "../shared/remote-target.js";
 import { JINN_HOME } from "../shared/paths.js";
 import { logger } from "../shared/logger.js";
-import { engineAvailable, type EngineName } from "../shared/models.js";
+import { engineAvailable, engineSupportsRemote, REMOTE_ENGINE_NAMES, type EngineName } from "../shared/models.js";
+import { remoteEngineAvailable } from "../engines/remote-stage.js";
 import {
   computeNextRetryDelayMs, computeRateLimitDeadlineMs, detectRateLimit, nextUnstatedParkDelayMs,
   rateLimitEngineLabel, MAX_UNSTATED_PARK_ATTEMPTS,
@@ -76,21 +77,28 @@ export async function handleRateLimit(opts: RateLimitHandlerOpts): Promise<RateL
   if (session.engine === "claude") recordClaudeRateLimit(rateLimit.resetsAt);
 
   // ── Branch A: hand the turn to this engine's chain ─────────────────────────
-  const isUsable = (candidate: EngineName) => engines.has(candidate) && engineAvailable(config, candidate);
+  // A remote employee's substitute has to be an engine that can ALSO run on that
+  // host, and the usability question moves there with it. Two ways to get this
+  // wrong, both silent: hand the turn to an engine that ignores `remoteHost` and
+  // it runs on the gateway — unattended, with --dangerously-skip-permissions,
+  // against a repository deliberately never cloned there; or ask
+  // `engineAvailable`, which probes the GATEWAY's PATH, and a Raspberry Pi
+  // orchestrating a desktop answers "no pi installed" about the wrong machine
+  // entirely. A chain with nothing left in it after this falls through to Branch
+  // B, which waits the limit out on the host that already owns the work.
+  const remote = isRemoteTarget(remoteTarget) ? remoteTarget : undefined;
+  const isUsable = (candidate: EngineName) => engines.has(candidate) && (remote
+    ? engineSupportsRemote(candidate) && remoteEngineAvailable(sshDestination(remote), candidate) !== false
+    : engineAvailable(config, candidate));
   const substituteName = resolveHealthyFallbackEngine(config, session.engine, isUsable, readEngineHealth());
   const substituteEngine = substituteName ? engines.get(substituteName) : undefined;
-  // No engine but the session's own has any notion of a remote host, so handing
-  // a remote employee's turn to a substitute would move it onto the gateway —
-  // unattended, with --dangerously-skip-permissions, against a repository that
-  // deliberately was never cloned there. Skipping Branch A leaves the turn to
-  // Branch B, which waits the limit out on the host that already owns the work.
-  const remoteSuppressesSubstitute = isRemoteTarget(remoteTarget);
-  if (substituteName && substituteEngine && remoteSuppressesSubstitute) {
+  if (!substituteName && remote) {
     logger.info(
-      `Session ${session.id} runs on ${remoteTarget.remoteHost} — not substituting ${rateLimitEngineLabel(substituteName)} for the ${engineLabel} usage limit (no engine can run remotely); waiting for the reset instead`,
+      `Session ${session.id} runs on ${remote.remoteHost} — nothing in ${engineLabel}'s fallback chain can run there `
+      + `(a substitute must be one of ${REMOTE_ENGINE_NAMES.join(", ")} and installed on that host); waiting for the reset instead`,
     );
   }
-  if (substituteName && substituteEngine && !remoteSuppressesSubstitute) {
+  if (substituteName && substituteEngine) {
     const { resumeAt } = computeNextRetryDelayMs(rateLimit.resetsAt);
     const until = resumeAt ?? new Date(Date.now() + 6 * 60 * 60_000);
     const syncSince = new Date().toISOString();
@@ -129,6 +137,12 @@ export async function handleRateLimit(opts: RateLimitHandlerOpts): Promise<RateL
       model: substitution.model ?? substitution.engineConfig.model,
       effortLevel: substitution.effortLevel,
       cliFlags: employee?.cliFlags ?? cliFlags,
+      // Where it runs. `cwd` above is the gateway's and means nothing on the
+      // other machine; the substitute branches on `remoteHost` and uses
+      // `remoteCwd` instead. Omit this and a remote employee's fallback turn
+      // comes back to the gateway — the failure Branch A used to be skipped
+      // entirely to avoid.
+      ...remoteTarget,
       ...resolveEngineRunMcp({ config, employee, engine: substituteName, sessionId: session.id }),
       attachments: attachments?.length ? attachments : undefined,
       sessionId: session.id,
