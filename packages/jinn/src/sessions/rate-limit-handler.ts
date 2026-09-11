@@ -35,7 +35,7 @@ import {
   rateLimitEngineLabel, MAX_UNSTATED_PARK_ATTEMPTS,
 } from "../shared/rateLimit.js";
 import { recordClaudeRateLimit } from "../shared/usageAwareness.js";
-import { readEngineHealth, recordEngineUnavailable, resolveHealthyFallbackEngine } from "../shared/engine-health.js";
+import { engineHealthForTarget, readEngineHealth, recordEngineUnavailable, resolveHealthyFallbackEngine } from "../shared/engine-health.js";
 import { beginEngineSubstitution } from "./engine-override.js";
 import { resolveEngineRunMcp } from "./engine-run-mcp.js";
 import { getSession, getMessages, updateSessionForAttempt, nextEngineSessionFields } from "./registry.js";
@@ -131,7 +131,14 @@ export async function handleRateLimit(opts: RateLimitHandlerOpts): Promise<RateL
   const isUsable = (candidate: EngineName) => engines.has(candidate) && (remote
     ? engineSupportsRemote(candidate) && remoteEngineAvailable(sshDestination(remote), candidate) !== false
     : engineAvailable(config, candidate));
-  const substituteName = resolveHealthyFallbackEngine(config, session.engine, isUsable, readEngineHealth());
+  const substituteName = resolveHealthyFallbackEngine(
+    config,
+    session.engine,
+    isUsable,
+    // Same scoping as a new session's: health recorded about the gateway's own
+    // login says nothing about the host this turn is going back to.
+    engineHealthForTarget(readEngineHealth(), remoteTarget),
+  );
   const substituteEngine = substituteName ? engines.get(substituteName) : undefined;
   if (!substituteName && remote) {
     logger.info(

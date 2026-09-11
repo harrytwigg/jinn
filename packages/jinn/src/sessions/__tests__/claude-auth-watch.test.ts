@@ -131,6 +131,10 @@ describe("observeClaudeTurnOutcome", () => {
       expect.stringContaining("claude auth login"),
       Math.floor((NOW.getTime() + CLAUDE_AUTH_RECHECK_MS) / 1000),
       NOW,
+      // Stamped with THIS machine: a remote employee's Claude Code is signed in
+      // on its own host, so a record that did not say whose login had died
+      // would steer its sessions off an engine that was working.
+      { host: os.hostname() },
     );
   });
 
@@ -206,7 +210,8 @@ describe("refuseClaudeLaunch", () => {
     expect(hoisted.sent[0]).toContain("There is no credentials file at /home/h/.claude/.credentials.json");
     expect(hoisted.sent[0]).toContain("claude auth login");
     // And new sessions are steered off Claude, which only the failure path did.
-    expect(recordEngineUnavailable).toHaveBeenCalledWith("claude", expect.stringContaining("claude auth login"), expect.any(Number), NOW);
+    expect(recordEngineUnavailable)
+      .toHaveBeenCalledWith("claude", expect.stringContaining("claude auth login"), expect.any(Number), NOW, { host: os.hostname() });
 
     // Every later refusal is counted, and stays quiet.
     refuseClaudeLaunch(undefined, at(60_000));
