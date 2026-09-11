@@ -1,3 +1,9 @@
+import { parseBlocksColumn, parseMetaColumn, rowToMessage, type MessageRow, type MessageMedia, type SessionMessage, type MessagePage, type MessagePageOptions } from './message-row.js';
+export type { MessageMedia, SessionMessage, MessagePage, MessagePageOptions } from './message-row.js';
+import { CALLBACK_DELIVERY_SELECT } from "./callback-delivery-query.js";
+import { pendingCompletionBatch } from "./completion-batching.js";
+export { coalescePendingParentCompletionQueueItems } from "./completion-batching.js";
+export { shouldHoldParentCompletionQueueDispatch, listReleasableParentCompletionQueuesForSource } from "./completion-drain.js";
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
@@ -6,6 +12,7 @@ import { initDb } from '../shared/db.js';
 import { stripControlChars } from '../shared/sanitize.js';
 import { getMeta, setMeta, canonicalCallbackIdentityText, canonicalSessionDeliveryIdentity, sessionDeliveryFromRow, validateSessionDeliveryIdentity, type SessionDeliveryRow } from './migrate.js';
 import { parseTodoId } from '../work-items/id.js';
+import { toWorkItemLinkRole } from '../work-items/link-role.js';
 import type { ChatBlock, ChatBlockEnvelope, EngineSessionRef, EngineSessionRefs, JsonObject, ReplyContext, Session, SessionAttemptOutcome, SessionDelivery, SessionDeliveryIdentity, SessionDeliveryPayload, WorkflowAttemptInterruptionCause, WorkflowSessionProvenance } from '../shared/types.js';
 import { blockFallbackText, mergeBlock, validateBlockEnvelope } from '../shared/blocks.js';
 import { ptySnapshotStore } from '../engines/pty-snapshot.js';
@@ -126,6 +133,7 @@ function rowToSession(row: Record<string, unknown>): Session {
     connector,
     sessionKey,
     workItemId: (row.work_item_id as string) ?? null,
+    workItemRole: (row.work_item_role as string) ? toWorkItemLinkRole(row.work_item_role) : null,
     replyContext: replyContext as ReplyContext | null,
     messageId: (row.message_id as string) ?? null,
     transportMeta,
@@ -1747,114 +1755,6 @@ export function deleteSessions(ids: string[]): number {
   return result.changes;
 }
 
-/** Attachment descriptor stored alongside a message and rendered by the web UI. */
-export interface MessageMedia {
-  type: 'image' | 'audio' | 'video' | 'file';
-  url: string;
-  name?: string;
-  mimeType?: string;
-  size?: number;
-  /** Displayed pixel size of an image, so the client can reserve its box before
-   * the bytes arrive. Absent when nothing measured it. */
-  width?: number;
-  height?: number;
-}
-
-export interface SessionMessage {
-  id: string;
-  role: string;
-  content: string;
-  timestamp: number;
-  /** Parsed from the `media` JSON column; undefined when the message has no attachments. */
-  media?: MessageMedia[];
-  /** True for a live mid-turn block. Most engines replace these at turn end. */
-  partial?: boolean;
-  /** Tool name when this block is a tool call — lets a reloaded block render as a tool card. */
-  toolCall?: string;
-  /** Native engine call id used to correlate interleaved tool results. */
-  toolId?: string;
-  /** Structured Chat Mode blocks rendered by the web UI. */
-  blocks?: ChatBlock[];
-  /** Safe structured UI metadata, used for reload-stable callback attribution. */
-  meta?: JsonObject;
-}
-
-interface MessageRow {
-  rowid: number;
-  id: string;
-  role: string;
-  content: string;
-  timestamp: number;
-  media: string | null;
-  partial: number | null;
-  seq: number | null;
-  tool_call: string | null;
-  tool_id: string | null;
-  blocks: string | null;
-  meta: string | null;
-}
-
-export interface MessagePage {
-  messages: SessionMessage[];
-  hasOlder: boolean;
-}
-
-export interface MessagePageOptions {
-  /** Fetch messages strictly older than this message id. Omit for the newest tail. */
-  before?: string;
-  /** Number of messages to return. Clamped to a bounded positive page size. */
-  limit?: number;
-}
-
-function parseMediaColumn(value: unknown): MessageMedia[] | undefined {
-  if (typeof value !== 'string' || !value.trim()) return undefined;
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) && parsed.length > 0 ? (parsed as MessageMedia[]) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function parseBlocksColumn(value: unknown): ChatBlock[] | undefined {
-  if (typeof value !== 'string' || !value.trim()) return undefined;
-  try {
-    const parsed = JSON.parse(value);
-    if (!Array.isArray(parsed)) return undefined;
-    const blocks = parsed.flatMap((block) => {
-      const result = validateBlockEnvelope({ op: "put", block });
-      return result.ok ? [result.envelope.block] : [];
-    });
-    return blocks.length > 0 ? blocks : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function parseMetaColumn(value: unknown): JsonObject | undefined {
-  if (typeof value !== 'string' || !value.trim()) return undefined;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as JsonObject : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function rowToMessage(r: MessageRow): SessionMessage {
-  const msg: SessionMessage = { id: r.id, role: r.role, content: r.content, timestamp: r.timestamp };
-  const media = parseMediaColumn(r.media);
-  const blocks = parseBlocksColumn(r.blocks);
-  const meta = parseMetaColumn(r.meta);
-  if (media) msg.media = media;
-  if (blocks) msg.blocks = blocks;
-  if (meta) msg.meta = meta;
-  if (r.partial) msg.partial = true;
-  if (r.tool_call) msg.toolCall = r.tool_call;
-  if (r.tool_id) msg.toolId = r.tool_id;
-  return msg;
-}
-
 function normalizeMessagePageLimit(limit: number | undefined): number {
   if (!Number.isFinite(limit) || !limit || limit < 1) return 100;
   return Math.min(500, Math.max(1, Math.floor(limit)));
@@ -1916,14 +1816,15 @@ export function insertMessageAfter(
   afterTimestamp: number,
   media?: MessageMedia[],
   blocks?: ChatBlock[],
+  meta?: JsonObject,
 ): string {
   const db = initDb();
   const id = uuidv4();
   const mediaJson = media && media.length > 0 ? JSON.stringify(media) : null;
   const blocksJson = blocks && blocks.length > 0 ? JSON.stringify(blocks) : null;
   const timestamp = Math.max(Date.now(), Math.floor(afterTimestamp) + 1);
-  db.prepare('INSERT INTO messages (id, session_id, role, content, timestamp, media, blocks) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-    id, sessionId, role, content, timestamp, mediaJson, blocksJson,
+  db.prepare('INSERT INTO messages (id, session_id, role, content, timestamp, media, blocks, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+    id, sessionId, role, content, timestamp, mediaJson, blocksJson, meta ? JSON.stringify(meta) : null,
   );
   return id;
 }
@@ -2258,30 +2159,6 @@ export function clearAllPartialMessages(): number {
   return db.prepare('DELETE FROM messages WHERE partial = 1').run().changes;
 }
 
-const CALLBACK_DELIVERY_SELECT = `
-  SELECT
-    id,
-    target_session_id AS targetSessionId,
-    source_kind AS sourceKind,
-    source_id AS sourceId,
-    source_attempt AS sourceAttempt,
-    source_outcome AS sourceOutcome,
-    source_version AS sourceVersion,
-    delivery_kind AS deliveryKind,
-    payload,
-    status,
-    message_id AS messageId,
-    queue_item_id AS queueItemId,
-    attempt_count AS attemptCount,
-    next_attempt_at AS nextAttemptAt,
-    last_attempt_at AS lastAttemptAt,
-    last_error AS lastError,
-    dead_lettered_at AS deadLetteredAt,
-    created_at AS createdAt,
-    accepted_at AS acceptedAt
-  FROM callback_deliveries
-`;
-
 export function getSessionDelivery(id: string): SessionDelivery | undefined {
   const row = initDb().prepare(`${CALLBACK_DELIVERY_SELECT} WHERE id = ?`).get(id) as SessionDeliveryRow | undefined;
   return row ? sessionDeliveryFromRow(row) : undefined;
@@ -2570,32 +2447,42 @@ export function recordSessionDeliveryFailure(
 
 /** Atomically turn one pending outbox row into the parent notification message
  * and its restart-safe internal queue intent. Accepted retries return the same
- * ids without inserting, emitting, or waking anything again. */
+ * ids without inserting, emitting, or waking anything again. Completion
+ * receipts may share a bounded pending row: this preserves every receipt and
+ * banner while preventing a settled backlog from spawning one engine per row. */
 export function acceptSessionDelivery(
   deliveryId: string,
   targetSessionId: string,
   sessionKey: string,
-): { delivery: SessionDelivery; accepted: boolean } {
+): { delivery: SessionDelivery; accepted: boolean; queueCreated: boolean } {
   const database = initDb();
   const accept = database.transaction(() => {
     const row = database.prepare(`${CALLBACK_DELIVERY_SELECT} WHERE id = ?`).get(deliveryId) as SessionDeliveryRow | undefined;
     if (!row) throw new Error(`Callback delivery ${deliveryId} not found`);
     if (row.targetSessionId !== targetSessionId) throw new Error('Session delivery target mismatch');
-    if (row.status === 'accepted') return { delivery: sessionDeliveryFromRow(row), accepted: false };
+    if (row.status === 'accepted') return { delivery: sessionDeliveryFromRow(row), accepted: false, queueCreated: false };
     if (row.status === 'dead_letter') throw new Error(`Callback delivery ${deliveryId} is dead-lettered`);
 
     const delivery = sessionDeliveryFromRow(row);
-    const queueItemId = randomUUID();
+    const batch = pendingCompletionBatch(database, delivery, targetSessionId, sessionKey);
+    const queueItemId = batch?.queueItemId ?? randomUUID();
     const messageId = uuidv4();
     const now = new Date().toISOString();
-    const position = (database.prepare(
-      "SELECT COALESCE(MAX(position), 0) + 1 AS pos FROM queue_items WHERE session_key = ? AND status = 'pending'",
-    ).get(sessionKey) as { pos: number }).pos;
-    database.prepare(`
-      INSERT INTO queue_items (
-        id, session_id, session_key, prompt, status, internal, position, created_at
-      ) VALUES (?, ?, ?, ?, 'pending', 1, ?, ?)
-    `).run(queueItemId, targetSessionId, sessionKey, delivery.payload.message, position, now);
+    if (batch) {
+      const updated = database.prepare(
+        "UPDATE queue_items SET prompt = ? WHERE id = ? AND status = 'pending'",
+      ).run(batch.prompt, batch.queueItemId);
+      if (updated.changes !== 1) throw new Error(`Callback completion batch ${batch.queueItemId} lost its pending claim`);
+    } else {
+      const position = (database.prepare(
+        "SELECT COALESCE(MAX(position), 0) + 1 AS pos FROM queue_items WHERE session_key = ? AND status = 'pending'",
+      ).get(sessionKey) as { pos: number }).pos;
+      database.prepare(`
+        INSERT INTO queue_items (
+          id, session_id, session_key, prompt, status, internal, position, created_at
+        ) VALUES (?, ?, ?, ?, 'pending', 1, ?, ?)
+      `).run(queueItemId, targetSessionId, sessionKey, delivery.payload.message, position, now);
+    }
     database.prepare(`
       INSERT INTO messages (id, session_id, role, content, timestamp, meta)
       VALUES (?, ?, 'notification', ?, ?, ?)
@@ -2614,7 +2501,7 @@ export function acceptSessionDelivery(
       WHERE id = ? AND status = 'pending'
     `).run(messageId, queueItemId, now, deliveryId);
     if (updated.changes !== 1) throw new Error(`Callback delivery ${deliveryId} lost its pending claim`);
-    return { delivery: getSessionDelivery(deliveryId)!, accepted: true };
+    return { delivery: getSessionDelivery(deliveryId)!, accepted: true, queueCreated: !batch };
   });
   return accept();
 }

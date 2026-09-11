@@ -267,4 +267,5 @@ describe("parent callback collapse", () => {
     expect(registry.getMessages(parent.id).filter((message) => message.role === "notification"))
       .toHaveLength(2);
   });
+
 });

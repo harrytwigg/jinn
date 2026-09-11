@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.33.3] - 2026-09-06
+
+### 🐛 Fixes
+- **Chat drafts survive navigation and reloads in the same tab.** Draft text stays with its chat and gateway, remains available when sending fails, and clears only after the message is accepted without erasing newer edits.
+- **Failed routes recover more reliably in WebKit.** Recovery refreshes preloaded dashboard assets before reloading the page, while normal navigation keeps its existing cache behavior.
+- **Phone controls are easier to tap.** Chat, navigation, settings, Todo filters and workflow controls have larger tap targets. Rows in More can wrap when text needs extra room.
+
+## [0.33.2] - 2026-09-06
+
+### ⚡ Performance
+- **Dashboard startup avoids unnecessary page downloads.** Chat and Todo routes no longer prefetch unconditionally while the browser is idle.
+
+### 🐛 Fixes
+- **Failed pages offer a clear way back.** Route failures explain when the browser is offline and enable Refresh once connectivity returns, without consuming the automatic stale-deploy retry while offline.
+- **Mobile chat is easier to navigate and read.** Chat controls have larger tap targets, pinch-to-zoom remains available, and the chat sidebar follows the visible viewport when the keyboard opens.
+- **Releases recover from delayed registry and Actions visibility.** Publishing waits for the exact npm version and workflow run, and completion can resume the same tag through GitHub Release, Homebrew, and announcement retries.
+- **Upgrade verification accepts backups from the previous version.** The gate checks the candidate's backup separately and still requires exactly one candidate backup containing the pre-upgrade files.
+
+## [0.33.1] - 2026-09-06
+
+### ✨ Features
+- **Todos are easier to scan and work through.** Board cards use a consistent four-row layout. Long descriptions and sub-task groups collapse, sub-tasks can be added inline, and empty sections stay out of the way. Runs and comments share one Activity stream, with threads ordered by their latest reply. Attach files from the paperclip row or drop them anywhere on the Todo view.
+- **Upgrades refresh shipped skills automatically.** Startup syncs the installed templates, restores missing shipped skills and retires recognized obsolete ones, with backups and a version receipt. Operator-authored skills remain separate, and modified legacy skills without a receipt are preserved. The manual migration-prompt handoff is removed.
+- **Provider login is available through Telegram.** The owner can recover Claude and Codex authentication from Telegram using provider links, callback input and device codes. Prompts and authentication input are scoped to the owner's active flow.
+- **Dashboard controls stay in predictable places.** Shared page headers and sheets bring consistent titles, actions and scrolling across the dashboard. Chats can also be opened in a separate browser tab from their menu.
+- **Workflow landing approvals can be assigned to the COO.** A gate can explicitly allow the operator's portal session to decide it, while employee sessions remain excluded. Operator-only gates retain their existing authority boundary.
+
+### 🐛 Fixes
+- **Settings save as you change them.** Controls commit their edits without a separate Save Config button, show save status and discard superseded edits when configuration is reloaded.
+- **Interrupted work keeps its messages and completion signals.** Messages hidden by an interrupt remain available to the engine, orphaned threads are filed, and stale parent completion callbacks are coalesced. Talk session cleanup follows the owning lifecycle.
+- **Work status follows the actual result.** Cron history reads the settled session and preserves failure reasons. Workflow closure requires the declared delivery evidence, and built-in employees hand blocked Todos upward instead of leaving them at a dead end.
+- **Mobile chat and Todo controls remain reachable.** The chat list reserves the top safe area, the floating action button clears the tab bar once, and attachment controls and collapsed threads have larger tap targets. Long titles truncate within their header.
+- **Live status stops showing stale success or empty usage.** Employee chat previews reconcile against current activity, and an all-zero Claude usage API response no longer replaces the available statusline reading.
+- **Release verification exercises the installed upgrade.** The exact candidate tarball is checked against npm's published latest in stock and customized disposable homes, including skill changes, backups and an unchanged second boot. Cleanup stops owned background writers before removing the fixtures.
+- **Upgrade verification runs native install scripts on every platform.** Baseline and candidate packages use normal npm lifecycle scripts, including Linux source builds. A published-baseline boot failure is reported as a harness/environment fault rather than a candidate rejection.
+
 ## [0.32.0] - 2026-08-24
 
 ### ✨ Features

@@ -71,11 +71,15 @@ function assertReceipt(home, version, skills) {
   }
 }
 
-function assertBackups(home, removedNames, exactCopies = []) {
+export function assertBackups(home, candidateVersion, removedNames, exactCopies = []) {
   const root = path.join(home, ".migration-backups")
   const backups = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name)
-  if (backups.length !== 1) throw new Error(`expected one first-boot backup, found ${backups.length}`)
-  const backup = path.join(root, backups[0])
+  // Published baselines since 0.33.1 can create their own boot-sync backup (PLA-394).
+  const candidateBackups = backups.filter((name) => name.startsWith(`${candidateVersion}-`))
+  if (candidateBackups.length !== 1) {
+    throw new Error(`expected one first-boot backup for candidate ${candidateVersion}, found ${candidateBackups.length}; backups: ${backups.join(", ")}`)
+  }
+  const backup = path.join(root, candidateBackups[0])
   for (const { file, bytes } of exactCopies) {
     const copy = path.join(backup, path.relative(home, file))
     if (!fs.existsSync(copy) || !fs.readFileSync(copy).equals(bytes)) {
@@ -89,8 +93,15 @@ function assertBackups(home, removedNames, exactCopies = []) {
 }
 
 async function boot(cli, layout, port, label) {
-  const handle = await startGateway(cli, layout, port, label)
-  await stopGateway(handle)
+  try {
+    const handle = await startGateway(cli, layout, port, label)
+    await stopGateway(handle)
+  } catch (error) {
+    const attribution = label === "published-latest"
+      ? "harness/environment fault: published baseline could not complete boot; candidate not evaluated"
+      : `candidate rejection: ${label} failed`
+    throw new Error(`${attribution}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+  }
 }
 
 function inspectSkillDelta(home, baselineRoot, candidateRoot) {
@@ -185,7 +196,7 @@ async function verifyScenario({ scenario, root, baseline, candidate }) {
   const removed = assertRetiredRemoved(layout.home, delta.retired, fixture?.preservedRetired)
   assertReceipt(layout.home, candidateInstall.version, delta.candidateSkills)
   assertVersionStamped(layout.home, candidateInstall.version)
-  const backup = assertBackups(layout.home, removed, exactBackupCopies(layout.home, configBefore, fixture))
+  const backup = assertBackups(layout.home, candidateInstall.version, removed, exactBackupCopies(layout.home, configBefore, fixture))
 
   const firstBootSurface = hashUpgradeSurface(layout.home)
   await boot(candidateInstall.cli, layout, port, "candidate-second-boot")
@@ -212,8 +223,12 @@ export async function main(argv = process.argv.slice(2)) {
     for (const item of scenarios) console.log(`PASS ${item.scenario} port=${item.port} rewritten=${item.rewritten} added=${item.added.length} restoredMissing=${item.restoredMissing ?? "n/a"} retired=${item.retired.length} preservedModified=${item.preservedModified ?? "n/a"} backup=${item.backup}`)
     return result
   } finally {
-    removeDisposableRoot(root)
-    console.log(`CLEANUP removed disposable root ${root}; all started gateways stopped`)
+    try {
+      await removeDisposableRoot(root)
+      console.log(`CLEANUP removed disposable root ${root}`)
+    } catch (error) {
+      console.error(`CLEANUP LEAK: disposable root ${root}; ${error instanceof Error ? error.message : String(error)}; manual cleanup required; verification result unchanged`)
+    }
   }
 }
 

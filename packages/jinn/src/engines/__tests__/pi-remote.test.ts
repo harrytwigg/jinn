@@ -250,12 +250,18 @@ describe("PiEngine — a remote employee's turn runs on the other machine", () =
     expect(hoisted.prepareCalls[0]!.resolvedMcp).toBe(resolvedMcp);
   });
 
-  it("prepends the remote node directory, or pi's shebang finds no interpreter", async () => {
+  it("prepends the remote node directory, then the instance's own bin/", async () => {
     // `pi` is npm-installed, so its shebang resolves node through PATH — and a
-    // non-interactive ssh on an nvm host has none.
+    // non-interactive ssh on an nvm host has none. The instance bin/ follows so
+    // the tools the operating instructions name bare — `mem` above all —
+    // resolve for a pi session exactly as they do for a Claude one; it is this
+    // session's OWN farm entry, so it carries the engine in its path.
     expect(hoisted.spawns.length).toBe(0);
     await engine().run(runOpts());
-    expect(remoteCommand()).toContain("PATH='/home/builder/.nvm/versions/node/v22.22.3/bin':\"$PATH\"");
+    expect(remoteCommand()).toContain(
+      "PATH='/home/builder/.nvm/versions/node/v22.22.3/bin':"
+      + `'${REMOTE_HOME}/bin':"$PATH"`,
+    );
   });
 
   it("refuses attachments instead of naming gateway paths the model cannot open", async () => {

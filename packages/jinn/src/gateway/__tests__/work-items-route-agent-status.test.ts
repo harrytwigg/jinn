@@ -92,6 +92,25 @@ describe("POST /api/work-items/:id/status — open to any authenticated session"
     expect([phaseClose.status, store.getWorkItem(phaseItem.id)?.status]).toEqual([200, "done"]);
   });
 
+  // DAH-214 item 1. A reviewer delegated onto an `in_review` Todo is linked to
+  // it — that is how their rounds are attributed and their comments route — and
+  // the ban used to read any link as "you executed this", refusing the reviewer
+  // the one transition they exist to make. The link now records WHY.
+  it("lets a session linked for review close the Todo, while the producer stays banned", async () => {
+    const producer = reg.createSession({ engine: "codex", source: "web", sourceRef: "review-link-producer" });
+    const reviewer = reg.createSession({ engine: "codex", source: "web", sourceRef: "review-link-reviewer" });
+    const item = store.createWorkItem({ title: "Reviewer closes", status: "in_review", assignee: "platform-worker" });
+    store.linkSession(item.id, producer.id);
+    store.linkSession(item.id, reviewer.id, null, "review");
+
+    const selfClose = await post(item.id, { status: "done" }, toolHeaders(producer.id));
+    expect(selfClose.status).toBe(403);
+    expect(selfClose.body.error).toMatch(/self-review ban/i);
+
+    const reviewClose = await post(item.id, { status: "done" }, toolHeaders(reviewer.id));
+    expect([reviewClose.status, store.getWorkItem(item.id)?.status]).toEqual([200, "done"]);
+  });
+
   it.each(["backlog", "assigned", "executing", "blocked"] as const)(
     "still refuses an unrelated session done from %s",
     async (status) => {

@@ -24,16 +24,32 @@ export interface OrgRead {
  */
 let cache: { registry: Map<string, Employee>; config?: JinnConfig; error?: string } | undefined;
 
+/**
+ * The last config a caller actually supplied, used whenever one arrives without.
+ *
+ * A config-less read means "the roster, as this instance is configured" — never
+ * "the roster of an instance with no configuration". The difference is not
+ * cosmetic: `scanOrg` validates every remote employee against `config.remote`
+ * and DROPS the ones it cannot vouch for, so scanning with `undefined` deletes
+ * every remote employee from the roster. That is how a delegated reviewer who
+ * spawns sessions and comments on Todos was told, by `assign_work_item`, that
+ * they were "not in the org roster" — the authority check reads the roster
+ * without a config, and the reviewer runs on another machine (DAH-214 item 2).
+ */
+let lastConfig: JinnConfig | undefined;
+
 /** Re-walk the org tree and cache the result. */
 export function refreshOrg(config?: JinnConfig): OrgRead {
+  const resolved = config ?? lastConfig;
+  if (config) lastConfig = config;
   try {
-    cache = { registry: scanOrg(config), config };
+    cache = { registry: scanOrg(resolved), config: resolved };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     // Keep the last known good roster. Handing back an empty map here would
     // read downstream as "the company has no employees", which is a different
     // and much more damaging claim than "the roster could not be read".
-    cache = { registry: cache?.registry ?? new Map(), config, error };
+    cache = { registry: cache?.registry ?? new Map(), config: resolved, error };
     logger.error(`Org scan failed — serving the last known roster of ${cache.registry.size} employee(s): ${error}`);
   }
   return { registry: cache.registry, error: cache.error };
@@ -43,7 +59,9 @@ export function refreshOrg(config?: JinnConfig): OrgRead {
 export function readOrg(config?: JinnConfig): OrgRead {
   // A degraded cache is not a valid one: retry the scan so a transient failure
   // costs one turn's roster rather than every turn until org/ next changes.
-  if (!cache || cache.error || cache.config !== config) return refreshOrg(config);
+  // A caller with no config of its own asks for whatever the cache holds; only
+  // a DIFFERENT explicit config is a reason to re-walk.
+  if (!cache || cache.error || (config !== undefined && cache.config !== config)) return refreshOrg(config);
   return { registry: cache.registry };
 }
 
@@ -54,4 +72,5 @@ export function orgRegistry(config?: JinnConfig): Map<string, Employee> {
 
 export function resetOrgRegistryForTests(): void {
   cache = undefined;
+  lastConfig = undefined;
 }

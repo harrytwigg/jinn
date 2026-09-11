@@ -85,12 +85,39 @@ describe("readOrg — caching", () => {
       engine: "codex",
       model: "gpt-custom",
     });
-    // The config-less form must not be served the config-derived answer.
+    // A caller with no config of its own asks for "the roster", not for "the
+    // roster of an instance with no configuration": it is served the last
+    // config's answer, and costs no rescan.
     expect(readOrg().registry.get("todo-dispatcher")).toMatchObject({
-      engine: "claude",
-      model: "sonnet",
+      engine: "codex",
+      model: "gpt-custom",
     });
-    expect(scan).toHaveBeenCalledTimes(3);
+    expect(scan).toHaveBeenCalledTimes(2);
+  });
+
+  // DAH-214 item 2. `scanOrg` DROPS a remote employee it cannot validate
+  // against `config.remote`, so scanning with `undefined` deleted every remote
+  // employee from the roster — and the Todo authority check reads the roster
+  // without a config. A delegated reviewer running on another machine was
+  // therefore told they were "not in the org roster" by `assign_work_item`,
+  // while delegation (which passes the config) resolved them fine.
+  it("keeps remote employees on a config-less read", () => {
+    const dir = path.join(tmpHome, "org", "platform");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "remote-reviewer.yaml"),
+      "name: remote-reviewer\ndepartment: platform\npersona: You review on another machine.\n"
+      + "remoteHost: 192.168.0.201\nremoteUser: harry\nremoteCwd: /srv/jinn-work/bluetel\n",
+      "utf-8",
+    );
+    const config = {
+      ...configFor("claude", "opus"),
+      remote: { root: "/srv/jinn-work", mount: "/mnt/jinn-home" },
+    } as unknown as JinnConfig;
+
+    expect(readOrg(config).registry.has("remote-reviewer")).toBe(true);
+    expect(orgRegistry().has("remote-reviewer")).toBe(true);
+    expect(refreshOrg().registry.has("remote-reviewer")).toBe(true);
   });
 });
 

@@ -25,6 +25,7 @@ import type { RemoteTarget, ResolvedMcpConfig } from "../shared/types.js";
 import type { RemoteExecutionConfig } from "../shared/config-types.js";
 import {
   buildSshSpawnArgs,
+  remoteSessionBinDir,
   ensureRemoteReady,
   remoteNodeDir,
   prepareRemoteSession,
@@ -1781,7 +1782,9 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
       // Claude Code runs every hook as bare `node`; without the resolved node
       // directory on PATH the relay cannot start, no Stop ever arrives, and the
       // turn hangs forever with nothing reported anywhere.
-      pathPrepend: [remoteNodeDir(facts)],
+      // The node directory first (hooks run as bare `node`), then the
+      // instance's own bin/ so `mem` and its neighbours resolve by name.
+      pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(staging.sessionHome)],
       bin: requireRemoteEngineBin(staging.destination, facts, "claude"),
       args,
     });
@@ -1916,7 +1919,7 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
             remoteEnv: this.buildRemoteEnv(jinnSessionId, staging, claudeConfigDir),
             envFile: staging.envFilePath,
             unsetRemoteEnv: InteractiveClaudeEngine.remoteEnvDeny(claudeConfigDir),
-            pathPrepend: [remoteNodeDir(facts)],
+            pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(staging.sessionHome)],
             bin: requireRemoteEngineBin(staging.destination, facts, "claude"),
             args: baseArgs(staging.settingsPath),
           });

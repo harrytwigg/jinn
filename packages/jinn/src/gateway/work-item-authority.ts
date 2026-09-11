@@ -4,6 +4,7 @@ import { orgRegistry } from "./org-registry.js";
 import type { WorkItemCaller } from "./work-item-arming.js";
 import { isPortalAgentSession, listSessionsByWorkItem } from "../sessions/registry.js";
 import type { Employee, Session } from "../shared/types.js";
+import { isExecutionAttempt } from "../work-items/link-role.js";
 import type { WorkItem, WorkItemStatus } from "../work-items/store.js";
 
 /**
@@ -68,7 +69,7 @@ function canReviewWorkItemDone(session: Session, item: WorkItem, linked: Session
   if (item.status !== 'in_review') {
     return { ok: false, error: `Todo ${item.id} is ${item.status}, and done is not an agent shortcut: ${instead}` };
   }
-  if (linked.some((s) => s.id === session.id && s.workflowProvenance?.kind !== 'phase')) {
+  if (linked.some((s) => s.id === session.id && isExecutionAttempt(s))) {
     return { ok: false, error: `session ${session.id} executed Todo ${item.id} and cannot close it (self-review ban): ${instead}, or close it from the human review surface` };
   }
   return { ok: true };

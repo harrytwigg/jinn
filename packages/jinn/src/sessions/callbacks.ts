@@ -1,3 +1,4 @@
+import { internalGatewayConnection, internalGatewayHeaders } from "./callback-connection.js";
 import {
   getSession,
   getSessionDelivery,
@@ -12,8 +13,6 @@ import {
 import { loadConfig } from "../shared/config.js";
 import { logger } from "../shared/logger.js";
 import { STRUCTURED_MESSAGE_BODY_MAX_CHARS, type Session } from "../shared/types.js";
-import { GATEWAY_INFO_FILE } from "../shared/paths.js";
-import { gatewayBaseUrl, readGatewayInfo } from "../gateway/gateway-info.js";
 import type { ChatBlockEnvelope, JsonObject } from "../shared/types.js";
 import { enforceDelegationCompletionContract } from "./delegation-completion-contract.js";
 import type { SessionDeliveryPayload } from "../shared/types.js";
@@ -87,13 +86,24 @@ export function notifyManagerVisibility(
 /**
  * Notify the parent session that a child session has replied.
  * Sends an internal message to the parent via the local HTTP API.
- * Fire-and-forget — errors are logged but never rethrown.
+ * Fire-and-forget compatibility wrapper. Turn settlement uses the awaited
+ * variant below so a source-drain hold cannot release before the final durable
+ * callback is accepted.
  */
 export function notifyParentSession(
   childSession: Session,
   result: { result?: string | null; error?: string | null; cost?: number; durationMs?: number },
   options?: { alwaysNotify?: boolean },
 ): void {
+  void notifyParentSessionAndWait(childSession, result, options);
+}
+
+/** Awaitable parent notification for completion paths that need durable ordering. */
+export async function notifyParentSessionAndWait(
+  childSession: Session,
+  result: { result?: string | null; error?: string | null; cost?: number; durationMs?: number },
+  options?: { alwaysNotify?: boolean },
+): Promise<void> {
   if (!result.error && !hasMeaningfulReply(result.result)) return;
 
   if (!childSession.parentSessionId) return;
@@ -112,8 +122,7 @@ export function notifyParentSession(
     }
   }
 
-  // Run asynchronously — do not await in the caller
-  _sendNotification(childSession, result, options).catch((err) => {
+  await _sendNotification(childSession, result, options).catch((err) => {
     logger.warn(`[callbacks] Failed to notify parent session ${childSession.parentSessionId}: ${err instanceof Error ? err.message : String(err)}`);
   });
 }
@@ -552,29 +561,4 @@ export function __resetCallbackRetrySweepForTest(): void {
   if (callbackRetryTimer) clearTimeout(callbackRetryTimer);
   callbackRetryTimer = undefined;
   callbackRetrySweepRunning = undefined;
-}
-
-function internalGatewayConnection(): { baseUrl: string; token?: string } {
-  const info = readGatewayInfo(GATEWAY_INFO_FILE);
-  let fallbackHost: string | undefined;
-  let fallbackPort = 7777;
-  try {
-    const config = loadConfig();
-    fallbackHost = config.gateway?.host;
-    fallbackPort = config.gateway?.port || 7777;
-  } catch {
-    // Use gateway.json/defaults if config is unavailable.
-  }
-  const port = info?.port ?? fallbackPort;
-  return {
-    baseUrl: gatewayBaseUrl({ port, host: info?.host }, fallbackHost),
-    token: info?.token,
-  };
-}
-
-function internalGatewayHeaders(gateway: { token?: string }): Record<string, string> {
-  return {
-    "Content-Type": "application/json",
-    ...(gateway.token ? { authorization: `Bearer ${gateway.token}` } : {}),
-  };
 }

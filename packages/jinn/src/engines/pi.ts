@@ -16,6 +16,7 @@ import {
   ensureRemoteReady,
   prepareRemoteSession,
   remoteNodeDir,
+  remoteSessionBinDir,
   requireRemoteEngineBin,
 } from "./remote-stage.js";
 
@@ -321,7 +322,10 @@ export class PiEngine implements InterruptibleEngine {
       // PATH — and a non-interactive ssh on a version-manager host has none.
       // Without this the spawn dies with `env: node: No such file or directory`
       // before pi prints a single line.
-      pathPrepend: [remoteNodeDir(facts)],
+      // Then the instance's own bin/, so the tools the operating instructions
+      // name bare — `mem` above all — resolve for a pi session exactly as they
+      // do for a Claude one.
+      pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(staging.sessionHome)],
       bin: requireRemoteEngineBin(staging.destination, facts, "pi"),
       args,
       // No remote tty: pi's stdout is a JSON stream the engine parses line by

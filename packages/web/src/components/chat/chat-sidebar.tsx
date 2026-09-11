@@ -1518,17 +1518,17 @@ export function ChatSidebar({
 
   return (
     <div className="relative z-10 flex h-full flex-col bg-[var(--sidebar-bg)] shadow-[var(--shadow-card)]">
-      {/* One slim control row. At rest it shows the Focused/All segmented
-          control (left) + a borderless search icon (right); tapping search
-          morphs the whole row into an inline search field. The page title and
-          "+ New" affordance now live in the header pill, so neither lives here.
-          Separation is fills only — no hairlines at rest. */}
-      {/* Control band — part of the List surface (--sidebar-bg), not the
-          Thread. A scroll-activated separator (below) is the only line; at rest
-          it's borderless. */}
+      {/* One slim control row — part of the List surface (--sidebar-bg), not
+          the Thread. At rest it shows the Focused/All segmented control (left)
+          + a borderless search icon (right); tapping search morphs the whole
+          row into an inline search field. The page title and "+ New" live in
+          the header pill. No hairlines at rest; the scroll-activated separator
+          below is the only line. The band owns its own top safe-area inset:
+          the chat route is `chromeless`, so PageLayout reserves none. */}
       <div
+        data-chat-list-controls
         className={cn(
-          "shrink-0 bg-[var(--sidebar-bg)] px-3 py-2 transition-shadow duration-150",
+          "shrink-0 bg-[var(--sidebar-bg)] px-3 pb-2 pt-[max(var(--safe-top),8px)] transition-shadow duration-150",
           listScrolled && "shadow-[0_1px_0_0_var(--separator)]",
         )}
       >
@@ -1578,7 +1578,7 @@ export function ChatSidebar({
               onClick={onNewChat}
               title="New chat"
               aria-label="New chat"
-              className="inline-flex size-9 shrink-0 items-center justify-center rounded-full text-[var(--text-secondary)] transition-colors hover:bg-[var(--fill-secondary)] hover:text-foreground"
+              className="inline-flex size-11 lg:size-9 shrink-0 items-center justify-center rounded-full text-[var(--text-secondary)] transition-colors hover:bg-[var(--fill-secondary)] hover:text-foreground"
             >
               <SquarePen className="size-[18px]" />
             </button>
@@ -1587,7 +1587,7 @@ export function ChatSidebar({
               onClick={() => setSearchOpen(true)}
               title="Search chats"
               aria-label="Search chats"
-              className="inline-flex size-9 shrink-0 items-center justify-center rounded-full text-[var(--text-secondary)] transition-colors hover:bg-[var(--fill-secondary)] hover:text-foreground"
+              className="inline-flex size-11 lg:size-9 shrink-0 items-center justify-center rounded-full text-[var(--text-secondary)] transition-colors hover:bg-[var(--fill-secondary)] hover:text-foreground"
             >
               <Search className="size-[18px]" />
             </button>

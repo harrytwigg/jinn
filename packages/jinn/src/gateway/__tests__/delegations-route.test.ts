@@ -715,6 +715,67 @@ describe("POST /api/delegations — the transaction (happy paths)", () => {
     });
   });
 
+  // DAH-214 item 1. Handing an `in_review` Todo to someone is handing it to a
+  // reviewer: the link records that, and the self-review ban — which reads the
+  // link, not the assignee — lets them record the close they were delegated to
+  // make. Producers on the same Todo stay banned.
+  it("links a delegate onto an in_review Todo as its REVIEWER, who can then close it", async () => {
+    const parentId = await createOperatorSession("producer handing off");
+    const item = store.createWorkItem({
+      title: "Ready for review",
+      status: "in_review",
+      source: "session",
+      sourceRef: `session:${parentId}:handoff`,
+    });
+    store.linkSession(item.id, parentId);
+
+    const resp = await call(
+      "POST",
+      "/api/delegations",
+      { workItemId: item.id, employee: "qa-emp", task: "Review the branch and close if it holds" },
+      { [CALLER_SESSION_HEADER]: parentId, [CALLER_SESSION_CAPABILITY_HEADER]: ensureSessionCapability(parentId) },
+    );
+
+    expect(resp.status).toBe(201);
+    expect(reg.getSession(resp.body.sessionId)).toMatchObject({ workItemId: item.id, workItemRole: "review" });
+    expect(store.getWorkItem(item.id)?.status).toBe("in_review");
+
+    const reviewerClose = await call(
+      "POST",
+      `/api/work-items/${item.id}/status`,
+      { status: "done" },
+      {
+        [CALLER_SESSION_HEADER]: resp.body.sessionId,
+        [CALLER_SESSION_CAPABILITY_HEADER]: ensureSessionCapability(resp.body.sessionId),
+        [TOOL_CALL_HEADER]: TOOL_CALL_HEADER_VALUE,
+      },
+    );
+    expect([reviewerClose.status, store.getWorkItem(item.id)?.status]).toEqual([200, "done"]);
+  });
+
+  it("takes an explicit review intent on a Todo that is not yet in review, and refuses an unknown one", async () => {
+    const parentId = await createOperatorSession("early reviewer");
+    const item = store.createWorkItem({
+      title: "Reviewer brought in early",
+      status: "executing",
+      source: "session",
+      sourceRef: `session:${parentId}:early`,
+    });
+
+    const resp = await call(
+      "POST",
+      "/api/delegations",
+      { workItemId: item.id, employee: "qa-emp", task: "Watch this one", intent: "review" },
+      { [CALLER_SESSION_HEADER]: parentId, [CALLER_SESSION_CAPABILITY_HEADER]: ensureSessionCapability(parentId) },
+    );
+    expect(resp.status).toBe(201);
+    expect(reg.getSession(resp.body.sessionId)?.workItemRole).toBe("review");
+
+    const bad = await call("POST", "/api/delegations", { engine: "codex", task: "nonsense intent", intent: "audit" });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toMatch(/intent must be one of/i);
+  });
+
   it("replays the original Todo/session for the same caller idempotency key", async () => {
     const beforeItems = workItemCount();
     const beforeSessions = reg.listSessions().length;

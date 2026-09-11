@@ -9,6 +9,7 @@ import { allocateWorkItemId, useWorkItemAllocationClaim } from './migrate.js';
 import { currentApproval, currentApprovalsByItem, type WorkItemApproval } from './approval-rows.js';
 import { createdEventDetail, type WriteOrigin } from './origin.js';
 import { HOME_SCOPE_SQL, KEPT_EXISTS_SQL } from './kept.js';
+import { toWorkItemLinkRole, type WorkItemLinkRole } from './link-role.js';
 import { searchWorkItemIds, workItemMatchReasons, type WorkItemMatch } from './search.js';
 import type { VerifyMode, VerifyPolicy } from './verify-policy.js';
 import type { WorkItemEventKind } from './event-log.js';
@@ -969,22 +970,24 @@ export function getWorkItemSpend(id: string): number {
  * redundant re-link (e.g. a cron re-fire re-linking the same item to the same session)
  * does not churn `work_items.updated_at` or the event log.
  */
-export function linkSession(workItemId: string, sessionId: string, actor?: string | null): void {
+export function linkSession(workItemId: string, sessionId: string, actor?: string | null, role: WorkItemLinkRole = 'execute'): void {
   const db = initDb();
   const todoId = parseTodoId(workItemId);
   const now = new Date().toISOString();
   const txn = db.transaction(() => {
     const session = db
-      .prepare('SELECT work_item_id FROM sessions WHERE id = ?')
-      .get(sessionId) as { work_item_id: string | null } | undefined;
+      .prepare('SELECT work_item_id, work_item_role FROM sessions WHERE id = ?')
+      .get(sessionId) as { work_item_id: string | null; work_item_role: string | null } | undefined;
     if (!session) throw new Error(`linkSession: session ${sessionId} not found`);
     const workItemExists = db.prepare('SELECT 1 FROM work_items WHERE id = ?').get(todoId);
     if (!workItemExists) throw new Error(`linkSession: work item ${todoId} not found`);
-    // Already linked to this exact item → no write, no `updated_at` bump.
-    if (session.work_item_id === todoId) return;
-    db.prepare('UPDATE sessions SET work_item_id = ? WHERE id = ?').run(todoId, sessionId);
+    // Already linked to this exact item, for the same reason → no write, no
+    // `updated_at` bump. A re-link that CHANGES the role still writes: the role
+    // is what the self-review ban reads, and a stale one is not a detail.
+    if (session.work_item_id === todoId && toWorkItemLinkRole(session.work_item_role) === role) return;
+    db.prepare('UPDATE sessions SET work_item_id = ?, work_item_role = ? WHERE id = ?').run(todoId, role, sessionId);
     db.prepare('UPDATE work_items SET updated_at = ?, version = version + 1 WHERE id = ?').run(now, todoId);
-    appendWorkItemEvent({ workItemId: todoId, kind: 'session_linked', actor, detail: { sessionId } });
+    appendWorkItemEvent({ workItemId: todoId, kind: 'session_linked', actor, detail: { sessionId, role } });
   });
   txn();
 }

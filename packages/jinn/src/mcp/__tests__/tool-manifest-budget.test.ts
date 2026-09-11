@@ -7,7 +7,7 @@ import { EXPECTED_ENUMS, EXPECTED_REQUIRED, EXPECTED_TOOL_NAMES } from "./tool-m
 // Fixed provider budget. Rebased for the experiment Todo link with the same
 // ~zero headroom discipline as before: new tool prose must stay concise rather
 // than growing into this ceiling.
-const MAX_MANIFEST_TOKENS = 6072;
+const MAX_MANIFEST_TOKENS = 6103;
 // Exact gate: js-tiktoken 1.0.21 with its local o200k_base ranks. The provider
 // projection is the OpenAI Responses API function-tool request shape pinned on 2026-07-12.
 const ATTESTED = {
@@ -184,9 +184,21 @@ const ATTESTED = {
   // the last of the restated enums and duplicated field lists. So the ceiling
   // moves by the remaining 64 and Pi sits ON it again. As before: the next
   // addition to this surface has to buy its room before it spends any.
-  rpc: { tokens: 5551, sha256: "38c8d571742952c0f18538a248ba382890ce27013c6f6ccb6e23c87ce89e920e" },
-  pi: { tokens: 6072, sha256: "6550e55e90a92778fd96031126f3b485b1f8b1f939911445e6d4a8d084ba1b25" },
-  openai: { tokens: 5762, sha256: "08338610f923005449889331f6159417661f2e6054b80448007db9a07d78eb47" },
+  // Rebased for `intent` on delegate_task (DAH-214 item 1). A delegation links
+  // the delegate's session to the Todo, and the self-review ban reads that link
+  // as "you produced this" — so a reviewer delegated to close a Todo was
+  // refused the close. The link now records WHY, and the Todo's own status
+  // supplies the answer for the ordinary handoff (an `in_review` Todo is being
+  // handed to a reviewer), which is why this property is an override rather
+  // than a required field. It is the cheapest shape that still tells an agent
+  // when to reach for it: two enum values and one clause naming the default,
+  // no prose restating the enum. That is 31 tokens, and — as the paragraphs
+  // above record — there is no dead prose left on this surface to buy them back
+  // with, so the ceiling moves by exactly that and Pi sits ON it again. The next
+  // addition to this surface has to buy its room before it spends any.
+  rpc: { tokens: 5582, sha256: "b38ac734a687cf4d8fa3e15cef177d301687b89854fbf0ba3f398ec2a3e4375d" },
+  pi: { tokens: 6103, sha256: "a039d326b6abec81fe24df4cbe3758751b54baeb3ce30f02ef8c087c295ec406" },
+  openai: { tokens: 5793, sha256: "ecb800c6904eb246eda11cd4fcbb503dba463ed7f6dc1769036562b6ae30f01e" },
 } as const;
 
 type TokenizerLoader = () => Promise<[{ Tiktoken: typeof import("js-tiktoken/lite").Tiktoken }, { default: typeof import("js-tiktoken/ranks/o200k_base").default }]>;

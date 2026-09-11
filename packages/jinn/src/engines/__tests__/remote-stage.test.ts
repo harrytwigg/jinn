@@ -40,7 +40,7 @@ vi.mock("node:dgram", () => {
   return { default: { createSocket }, createSocket };
 });
 
-import { shq, buildSshSpawnArgs, sendWakeOnLan, FACTS_SCRIPT, FARM_SCRIPT, buildTrustSeedCommand, trustSeedKey, runLocalWakeCommand, requireRemoteEngineBin, remoteSessionHome, buildSessionEnvFile } from "../remote-stage.js";
+import { shq, buildSshSpawnArgs, sendWakeOnLan, FACTS_SCRIPT, FARM_SCRIPT, buildTrustSeedCommand, trustSeedKey, runLocalWakeCommand, requireRemoteEngineBin, remoteSessionHome, remoteSessionBinDir, buildSessionEnvFile } from "../remote-stage.js";
 import { remotePiExtensionSource } from "../pi-mcp.js";
 import { JINN_HOME } from "../../shared/paths.js";
 
@@ -681,6 +681,15 @@ describe("remoteSessionHome — per session AND per engine", () => {
 
   it("still cannot walk out of the sessions directory", () => {
     expect(remoteSessionHome(FACTS, "../../etc", "pi")).toBe(`${FACTS.stageDir}/sessions/.._.._etc__pi`);
+  });
+
+  it("puts the PATH's bin/ inside the home the spawn was actually given", () => {
+    // The farm symlinks the mounted home's bin/ into EACH session home, so the
+    // entry only exists under the home this spawn staged. Derived from that
+    // home rather than re-derived from the session id, which under a per-engine
+    // home is how the PATH ends up naming a farm nobody built.
+    const home = remoteSessionHome(FACTS, "sess-1", "pi");
+    expect(remoteSessionBinDir(home)).toBe(`${home}/bin`);
   });
 });
 

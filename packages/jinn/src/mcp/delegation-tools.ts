@@ -109,6 +109,11 @@ export function buildDelegationTools(): JinnMcpTool[] {
         effortLevel: { type: "string" },
         title: { type: "string" },
         workItemId: { type: "string" },
+        intent: {
+          type: "string",
+          enum: ["execute", "review"],
+          description: "review if this delegate reviews rather than executes; defaults from the Todo status.",
+        },
         idempotencyKey: { type: "string" },
         attachments: {
           type: "array",
@@ -123,7 +128,7 @@ export function buildDelegationTools(): JinnMcpTool[] {
       if (!ctx.callerSessionId) throw new JinnMcpToolError(UNIDENTIFIED_TOOL_CALL_ERROR);
       const task = requireString(args, "task");
       const body: Record<string, unknown> = { task };
-      for (const key of ["employee", "engine", "model", "effortLevel", "title", "workItemId", "idempotencyKey"] as const) {
+      for (const key of ["employee", "engine", "model", "effortLevel", "title", "workItemId", "intent", "idempotencyKey"] as const) {
         const v = optionalString(args, key);
         if (v !== undefined) body[key] = v;
       }
