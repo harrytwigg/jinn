@@ -83,3 +83,40 @@ describe("engineHealthForTarget", () => {
     expect(JSON.parse(fs.readFileSync(STATE_PATH, "utf-8")).claude.host).toBe(GATEWAY);
   });
 });
+
+/**
+ * A host-scoped record must not swallow an account-wide one.
+ *
+ * There is one record per engine, so the two kinds of fact compete for the same
+ * slot, and getting that wrong is silent in the direction that matters: a real
+ * account quota, hidden behind a host stamp, reads as "healthy" to every remote
+ * session — which is the exact failure this whole scoping exists to avoid,
+ * arriving through the mechanism meant to prevent it.
+ */
+describe("engineHealthForTarget — a host stamp must not outlive its observation", () => {
+  const GATEWAY = hostname();
+  const REMOTE = { remoteHost: "build-box", remoteUser: "jinn", remoteCwd: "/srv/jinn-work/main" };
+
+  it("does not carry a host onto a later account-wide observation", () => {
+    // The gateway's login dies, then a usage limit that states no reset arrives.
+    // The second is the ACCOUNT's and holds everywhere; re-probing the first
+    // must not lend it a host.
+    recordEngineUnavailable("claude", "authentication failed", secondsAt(90), NOW, { host: GATEWAY });
+    recordEngineUnavailable("claude", "usage limit", undefined, NOW);
+
+    expect(isEngineExhausted(engineHealthForTarget(readEngineHealth(NOW), REMOTE), "claude", NOW)).toBe(true);
+  });
+
+  it("does not let a host-scoped record replace a live account-wide one", () => {
+    // A spent account quota outranks one machine's dead login: the login is
+    // advisory here (preflight is what refuses a launch), while the quota is the
+    // reason no host can serve the turn at all.
+    recordEngineUnavailable("claude", "usage limit", secondsAt(240), NOW);
+    recordEngineUnavailable("claude", "authentication failed", secondsAt(90), NOW, { host: GATEWAY });
+
+    const scoped = engineHealthForTarget(readEngineHealth(NOW), REMOTE);
+    expect(isEngineExhausted(scoped, "claude", NOW)).toBe(true);
+    // And the stated reopening is still the quota's, not the login's recheck.
+    expect(readEngineHealth(NOW).claude.until).toBe(new Date(secondsAt(240) * 1000).toISOString());
+  });
+});

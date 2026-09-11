@@ -59,6 +59,12 @@ export function validateNewSessionSelection(
   let defaultModel = defaults.model;
   let defaultEffortLevel = defaults.effortLevel;
   if (body.engine === undefined && body.model === undefined && isKnownEngine(engine)) {
+    // NOT scoped by host, unlike the other two engine-choosing paths: `defaults`
+    // carries the employee's NAME, not its record, so this cannot tell whether
+    // the session runs here or on another machine. Until the Employee is
+    // threaded through this path's four callers it also cannot apply the
+    // remote-capability filter `newSessionEngineSelection` has — the same
+    // missing argument, and the same fix.
     const healthy = preferHealthySessionEngine(
       config,
       engine,

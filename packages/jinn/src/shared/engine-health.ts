@@ -1,11 +1,21 @@
-import fs from "node:fs";
 import { hostname } from "node:os";
-import path from "node:path";
 import { resolveFallbackEngine } from "./engine-fallback.js";
+import {
+  isSpent,
+  readEngineHealth,
+  readStore,
+  writeStore,
+  type EngineHealth,
+  type EngineHealthReading,
+} from "./engine-health-store.js";
 import type { EngineName } from "./models.js";
-import { JINN_HOME } from "./paths.js";
 import { isRemoteTarget } from "./remote-target.js";
 import type { EngineLimitWindow, JinnConfig, ModelRegistry, RemoteTarget } from "./types.js";
+
+// Re-exported so the store split is invisible to callers: every consumer of this
+// module reads a record and asks a question about it in the same breath.
+export { readEngineHealth };
+export type { EngineHealth, EngineHealthReading, EngineHealthState } from "./engine-health-store.js";
 
 /**
  * Whether an engine can actually serve a turn, beside the installed-availability
@@ -17,103 +27,6 @@ import type { EngineLimitWindow, JinnConfig, ModelRegistry, RemoteTarget } from 
  * health would have left them nothing. The worst a wrong record can do is order
  * a chain differently — it can never refuse a turn.
  */
-
-export type EngineHealthState = "ok" | "exhausted" | "degraded";
-
-export interface EngineHealth {
-  state: EngineHealthState;
-  /** ISO. The reopening the engine itself stated, verbatim: what every display
-   *  surface shows, and the moment the record is spent. */
-  until?: string;
-  /** ISO. When a dispatcher may offer the engine a probing turn again, on an
-   *  `exhausted` record. Internal — a shorter belief than `until`, never a
-   *  shorter claim, so it is deliberately not displayed anywhere. */
-  recheckAt?: string;
-  /** The binding quota window as telemetry names it (`5h`, `7d`), when it does. */
-  window?: string;
-  /**
-   * The machine this record is about, when it is about ONE machine rather than
-   * the account.
-   *
-   * Almost every record here describes an allowance — a provider's quota window
-   * — which is the same fact wherever the turn runs. A login is not: a remote
-   * employee signs its engine in on its own host, and the gateway cannot read
-   * that login or speak for it. Recording one without saying whose it was is
-   * how a dead login on the orchestrator reroutes sessions that were never
-   * going to use it. Absent = about the account, and applies everywhere.
-   */
-  host?: string;
-  reason?: string;
-  observedAt?: string;
-}
-
-/** Live readings keyed by engine name. An engine with no entry is healthy. */
-export type EngineHealthReading = Record<string, EngineHealth>;
-
-const STATE_PATH = path.join(JINN_HOME, "tmp", "engine-health.json");
-
-/** How long a stated reopening is taken on trust before the engine is offered a
- *  probing turn regardless. A weekly window is real and is displayed as stated;
- *  a misparse that reads as one still self-corrects inside this. */
-const REPROBE_INTERVAL_MS = 12 * 60 * 60_000;
-
-/** How long a failure that stated no reopening stays on the record. It says the
- *  provider just refused a turn, which is worth a brief preference away and is
- *  not worth believing for an afternoon. */
-const DEGRADED_WINDOW_MS = 15 * 60_000;
-
-const HEALTH_STATES: readonly string[] = ["ok", "exhausted", "degraded"];
-
-function readStore(): EngineHealthReading {
-  try {
-    if (!fs.existsSync(STATE_PATH)) return {};
-    const parsed = JSON.parse(fs.readFileSync(STATE_PATH, "utf-8")) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const store: EngineHealthReading = {};
-    for (const [engine, record] of Object.entries(parsed as Record<string, EngineHealth | null>)) {
-      if (record && typeof record === "object" && HEALTH_STATES.includes(record.state)) store[engine] = record;
-    }
-    return store;
-  } catch {
-    return {};
-  }
-}
-
-function writeStore(store: EngineHealthReading): void {
-  try {
-    fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-    const tmp = `${STATE_PATH}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(store, null, 2), "utf-8");
-    fs.renameSync(tmp, STATE_PATH);
-  } catch {
-    // best-effort only
-  }
-}
-
-/**
- * Whether a record has outlived what it stated. Expiry is what the clock says
- * rather than what a sweeper got around to, so a record can never outlive its
- * own window — and an `until` that will not parse counts as spent, because
- * fail-open is the only safe direction for advice.
- */
-function isSpent(record: EngineHealth, now: Date): boolean {
-  if (record.state === "ok") return true;
-  if (record.until === undefined) return false;
-  const until = Date.parse(record.until);
-  return !Number.isFinite(until) || until <= now.getTime();
-}
-
-/** Every engine something has been observed about, with a record whose window
- *  has passed reading back as `ok`. */
-export function readEngineHealth(now: Date = new Date()): EngineHealthReading {
-  const live: EngineHealthReading = {};
-  for (const [engine, record] of Object.entries(readStore())) {
-    live[engine] = isSpent(record, now)
-      ? { state: "ok", ...(record.observedAt ? { observedAt: record.observedAt } : {}) }
-      : record;
-  }
-  return live;
-}
 
 /**
  * The reading as a session bound for `target` should read it.
@@ -130,6 +43,13 @@ export function readEngineHealth(now: Date = new Date()): EngineHealthReading {
  *
  * Dropped rather than rewritten to `ok`: the record has nothing to say here,
  * and an entry saying "healthy" would be a claim this function cannot make.
+ *
+ * The comparison is against the LIVE hostname while the record is on disk, so a
+ * gateway whose hostname changes under it — a container recreated against the
+ * same home volume — stops recognising its own records. That fails open, which
+ * is the direction this whole store fails in: the record is ignored, the session
+ * starts where it preferred, and a dead local Claude login is still refused by
+ * preflight, which reads the credentials file rather than this.
  */
 export function engineHealthForTarget(
   health: EngineHealthReading,
@@ -159,6 +79,16 @@ export function isEngineExhausted(health: EngineHealthReading, engine: string, n
   const recheckAt = Date.parse(record.recheckAt);
   return Number.isFinite(recheckAt) && recheckAt > now.getTime();
 }
+
+/** How long a stated reopening is taken on trust before the engine is offered a
+ *  probing turn regardless. A weekly window is real and is displayed as stated;
+ *  a misparse that reads as one still self-corrects inside this. */
+const REPROBE_INTERVAL_MS = 12 * 60 * 60_000;
+
+/** How long a failure that stated no reopening stays on the record. It says the
+ *  provider just refused a turn, which is worth a brief preference away and is
+ *  not worth believing for an afternoon. */
+const DEGRADED_WINDOW_MS = 15 * 60_000;
 
 /** The record still inside the window it stated, if there is one. What a failed
  *  re-probe is allowed to keep, rather than replace with a vaguer claim. */
@@ -205,19 +135,40 @@ export function recordEngineUnavailable(
     ? resetsAtSeconds * 1000
     : undefined;
   const store = readStore();
-  const observed = { reason, observedAt: now.toISOString(), ...definedOnly(about) };
-  const live = stated === undefined ? liveRecord(store, engine, now) : undefined;
+  const standing = liveRecord(store, engine, now);
+  // One machine's problem must not displace an account-wide one. There is a
+  // single record per engine, and an allowance NO host can serve outranks a
+  // login only this host cannot use — dropping the allowance would leave the
+  // engine reading healthy to every remote session, which is the exact failure
+  // {@link engineHealthForTarget} exists to prevent, arriving through the
+  // mechanism meant to prevent it.
+  if (about.host !== undefined && standing?.state === "exhausted" && standing.host === undefined) return;
 
-  let record: EngineHealth;
-  if (stated !== undefined) {
-    record = { state: "exhausted", until: new Date(stated).toISOString(), recheckAt: recheckFrom(stated, now) };
-  } else if (live?.state === "exhausted") {
-    const statedOnRecord = live.until === undefined ? undefined : Date.parse(live.until);
-    record = { ...live, recheckAt: recheckFrom(statedOnRecord, now) };
-  } else {
-    record = { state: "degraded", until: new Date(now.getTime() + DEGRADED_WINDOW_MS).toISOString() };
-  }
+  const observed = { reason, observedAt: now.toISOString(), ...definedOnly(about) };
+  const live = stated === undefined ? standing : undefined;
+  const record = nextRecord(stated, live, now);
   writeStore({ ...store, [engine]: { ...record, ...observed } });
+}
+
+/** The window part of the next record: what a re-probe keeps, and what a stated
+ *  reopening replaces outright. */
+function nextRecord(stated: number | undefined, live: EngineHealth | undefined, now: Date): EngineHealth {
+  if (stated !== undefined) {
+    return { state: "exhausted", until: new Date(stated).toISOString(), recheckAt: recheckFrom(stated, now) };
+  }
+  if (live?.state !== "exhausted") {
+    return { state: "degraded", until: new Date(now.getTime() + DEGRADED_WINDOW_MS).toISOString() };
+  }
+  // `host` is deliberately NOT carried across: it describes the OBSERVATION, and
+  // the caller's own `about` re-supplies it when this observation names a host
+  // too. Carried, a gateway-scoped login would quietly scope the account-wide
+  // window it was re-probing, hiding a real limit from every remote session.
+  return {
+    state: "exhausted",
+    ...(live.until === undefined ? {} : { until: live.until }),
+    ...(live.window === undefined ? {} : { window: live.window }),
+    recheckAt: recheckFrom(live.until === undefined ? undefined : Date.parse(live.until), now),
+  };
 }
 
 /**
