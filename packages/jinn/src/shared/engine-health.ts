@@ -1,9 +1,11 @@
 import fs from "node:fs";
+import { hostname } from "node:os";
 import path from "node:path";
 import { resolveFallbackEngine } from "./engine-fallback.js";
 import type { EngineName } from "./models.js";
 import { JINN_HOME } from "./paths.js";
-import type { EngineLimitWindow, JinnConfig, ModelRegistry } from "./types.js";
+import { isRemoteTarget } from "./remote-target.js";
+import type { EngineLimitWindow, JinnConfig, ModelRegistry, RemoteTarget } from "./types.js";
 
 /**
  * Whether an engine can actually serve a turn, beside the installed-availability
@@ -29,6 +31,18 @@ export interface EngineHealth {
   recheckAt?: string;
   /** The binding quota window as telemetry names it (`5h`, `7d`), when it does. */
   window?: string;
+  /**
+   * The machine this record is about, when it is about ONE machine rather than
+   * the account.
+   *
+   * Almost every record here describes an allowance — a provider's quota window
+   * — which is the same fact wherever the turn runs. A login is not: a remote
+   * employee signs its engine in on its own host, and the gateway cannot read
+   * that login or speak for it. Recording one without saying whose it was is
+   * how a dead login on the orchestrator reroutes sessions that were never
+   * going to use it. Absent = about the account, and applies everywhere.
+   */
+  host?: string;
   reason?: string;
   observedAt?: string;
 }
@@ -101,6 +115,35 @@ export function readEngineHealth(now: Date = new Date()): EngineHealthReading {
   return live;
 }
 
+/**
+ * The reading as a session bound for `target` should read it.
+ *
+ * A record that names a host describes that machine's login, not the account's
+ * allowance, so it says nothing about a turn that will run somewhere else — and
+ * the two dispatchers below read the same global store for local and remote
+ * sessions alike. Without this, a dead `claude` login ON THE GATEWAY reroutes a
+ * remote Claude employee whose own host is signed in perfectly well: a turn
+ * moved onto a substitute for a reason that was never about it.
+ *
+ * Records with no host are about the account and survive untouched, which is
+ * every quota record — those really do hold wherever the turn runs.
+ *
+ * Dropped rather than rewritten to `ok`: the record has nothing to say here,
+ * and an entry saying "healthy" would be a claim this function cannot make.
+ */
+export function engineHealthForTarget(
+  health: EngineHealthReading,
+  target: RemoteTarget | undefined,
+): EngineHealthReading {
+  const host = isRemoteTarget(target) ? target.remoteHost : hostname();
+  const out: EngineHealthReading = {};
+  for (const [engine, record] of Object.entries(health)) {
+    if (record.host !== undefined && record.host !== host) continue;
+    out[engine] = record;
+  }
+  return out;
+}
+
 /** The one question a dispatcher asks, and the only reader of `recheckAt`: past
  *  the re-probe the engine is offered a turn again even though the record still
  *  reads — and still displays — as out until its stated reset.
@@ -131,6 +174,16 @@ function recheckFrom(statedMs: number | undefined, now: Date): string {
   return new Date(statedMs === undefined ? reprobeAt : Math.min(statedMs, reprobeAt)).toISOString();
 }
 
+/** The stated parts of `about`, so an absent one is absent from the record
+ *  rather than present-and-undefined — which `JSON.stringify` would drop from
+ *  the file anyway, leaving the two shapes silently different in memory. */
+function definedOnly(about: { window?: string; host?: string }): { window?: string; host?: string } {
+  return {
+    ...(about.window === undefined ? {} : { window: about.window }),
+    ...(about.host === undefined ? {} : { host: about.host }),
+  };
+}
+
 /**
  * Note that an engine could not serve a turn, given whatever it said about when
  * it can again.
@@ -146,13 +199,13 @@ export function recordEngineUnavailable(
   reason: string,
   resetsAtSeconds?: number,
   now: Date = new Date(),
-  window?: string,
+  about: { window?: string; host?: string } = {},
 ): void {
   const stated = resetsAtSeconds !== undefined && Number.isFinite(resetsAtSeconds)
     ? resetsAtSeconds * 1000
     : undefined;
   const store = readStore();
-  const observed = { reason, observedAt: now.toISOString(), ...(window === undefined ? {} : { window }) };
+  const observed = { reason, observedAt: now.toISOString(), ...definedOnly(about) };
   const live = stated === undefined ? liveRecord(store, engine, now) : undefined;
 
   let record: EngineHealth;
@@ -186,7 +239,7 @@ export function recordExhaustedWindows(
     reopensAt = resetsAt;
     binding = window;
   }
-  if (binding) recordEngineUnavailable(engine, "quota window spent", binding.resetsAt, now, binding.name);
+  if (binding) recordEngineUnavailable(engine, "quota window spent", binding.resetsAt, now, { window: binding.name });
 }
 
 /**

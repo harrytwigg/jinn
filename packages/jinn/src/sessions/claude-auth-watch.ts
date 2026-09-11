@@ -140,8 +140,12 @@ function raiseClaudeAuthOutage({ scope, note, status, reason, kind }: ClaudeAuth
     // stands, and the dashboard shows why. Preflight, not this record, is
     // what actually refuses a launch. Re-stamped on a refusal too, so the
     // record cannot lapse into "ok" while every launch is still being refused.
+    // Stamped with the host, because THIS login is this machine's. A remote
+    // employee signs Claude Code in on its own box, so a record that did not say
+    // whose login had died would reroute its sessions too — off an engine that
+    // was working, for a reason that was never about it.
     recordEngineUnavailable("claude", `authentication failed — run \`claude auth login\` on ${hostname()}`,
-      Math.floor((now.getTime() + CLAUDE_AUTH_RECHECK_MS) / 1000), now);
+      Math.floor((now.getTime() + CLAUDE_AUTH_RECHECK_MS) / 1000), now, { host: hostname() });
   }
   if (!claimClaudeAuthAlert(scope, now)) {
     const tally = `${note.outage.failures} failed, ${note.outage.skipped} skipped since ${note.outage.since}`;
