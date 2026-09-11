@@ -46,6 +46,8 @@ locally.
      Code profile* below — do not point Jinn at the wrapper script.
    - `pi`: **the Pi CLI**, with its providers configured in that host's
      `~/.pi/agent/models.json`. See *Running Pi remotely* below.
+   - `opencode`: **the opencode CLI**, signed in there with
+     `opencode auth login`. See *Running opencode remotely* below.
 2. **Node.js**. Note the PATH caveat below — this is the single most likely
    thing to bite you.
 3. **`jinn-cli` at the gateway's exact version**, installed globally:
@@ -90,10 +92,11 @@ default PATH:
 ln -s "$(command -v node)" ~/.local/bin/node
 ```
 
-Verify with `ssh <host> 'command -v node jinn'`, plus `claude` or `pi` for the
-engine that employee runs — each must print. `pi` needs this as much as Claude
-Code does: it is an npm-installed CLI, so its shebang resolves `node` through
-PATH, and a version-managed host gives a non-interactive ssh none.
+Verify with `ssh <host> 'command -v node jinn'`, plus `claude`, `pi` or
+`opencode` for the engine that employee runs — each must print. `pi` needs this
+as much as Claude Code does: it is an npm-installed CLI, so its shebang resolves
+`node` through PATH, and a version-managed host gives a non-interactive ssh
+none.
 
 5. **Key-only SSH from the gateway.** Sessions run with `BatchMode=yes`, so a
    passphrase-locked key with no agent will simply fail. The host key must
@@ -245,7 +248,51 @@ provider an inherited key is how it works at all. What a Pi session does strip i
 exactly what a local one strips: the markers that tell a nested CLI it is running
 inside another agent.
 
-## Pi as the fallback when Claude hits its limit
+## Running opencode remotely
+
+opencode is the third relocatable engine, and it rides the transport the same
+way Pi does — a prompt on stdin, newline-delimited JSON on stdout, `ssh -T` so
+the remote stderr is not folded into that stream.
+
+```yaml
+name: scout
+displayName: Scout
+department: engineering
+engine: opencode
+model: anthropic/claude-sonnet-5   # opencode's provider/model, as that host resolves it
+remoteHost: build-box
+remoteUser: jinn
+remoteCwd: /srv/jinn-work/main
+```
+
+The login that matters is the **remote** one: `opencode auth login` on that
+machine. The gateway never reads it, and never refuses a turn over it — the same
+rule that exempts remote employees from the Claude auth preflight.
+
+Two things are staged, and one deliberately is not:
+
+- **The company toolset is an `OPENCODE_CONFIG` file**, which makes this the
+  simplest of the three wirings: opencode reads a real MCP config, so the
+  session's resolved server set is re-pointed at the remote install exactly as
+  Claude's is and written as opencode's own `mcp` block. Mode 0600, because the
+  projected `environment` carries this session's capability. The bearer still
+  comes from `<JINN_HOME>/gateway.json` over the reverse tunnel.
+- **`OPENCODE_DISABLE_AUTOUPDATE=1`**, so a self-upgrade between two turns of one
+  session cannot swap the binary under a conversation opencode is still holding.
+- **Nothing relocates opencode's data directory.** There is no opencode
+  equivalent of Pi's staged `--session-dir`, and that is on purpose: opencode's
+  session store and its `auth.json` live side by side under the remote user's
+  home, so moving the store would take the login with it and every turn would
+  start unauthenticated. opencode generates its own session ids, so concurrent
+  sessions in that one store cannot collide the way Pi's would.
+
+The `ANTHROPIC_*` asymmetry described for Pi above applies to opencode for the
+same reason, and a little more broadly: opencode reads provider keys for many
+providers, and none of them are stripped from the remote login environment. It
+has no subscription auth to fall off, and for a key-authenticated provider an
+inherited key is how it works at all.
+
+## Pi or opencode as the fallback when Claude hits its limit
 
 An engine's `fallback` chain works for remote employees, with one rule: a
 substitute must be an engine that can follow the session onto its host.
