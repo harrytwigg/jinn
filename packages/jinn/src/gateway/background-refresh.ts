@@ -11,6 +11,8 @@ import type { JinnConfig } from "../shared/types.js";
 import { logger } from "../shared/logger.js";
 import { collectEngineLimits } from "../shared/engine-limits.js";
 import { readEngineHealth } from "../shared/engine-health.js";
+import { engineAvailable } from "../shared/models.js";
+import { checkClaudeRefreshExpiry, observeClaudeCredentialsValid } from "../sessions/claude-auth-watch.js";
 import {
   refreshAntigravityModels,
   refreshClaudeModels,
@@ -50,7 +52,7 @@ export function startBackgroundRefreshes(getConfig: () => JinnConfig, emit: Gate
   const refreshModels = (): void => {
     const config = getConfig();
     void Promise.all([
-      refreshClaudeModels(config),
+      refreshClaudeModels(config).then((authenticated) => { if (authenticated) observeClaudeCredentialsValid(); }),
       refreshCodexModels(config),
       refreshAntigravityModels(config),
       refreshPiModels(config),
@@ -64,6 +66,9 @@ export function startBackgroundRefreshes(getConfig: () => JinnConfig, emit: Gate
   // health store, so this needs no persistence of its own — it only makes the
   // reading exist before a session burns a turn discovering it.
   const refreshEngineHealth = (): void => {
+    // The one credential expiry that is predictable and fatal: the refresh
+    // token's. Announced once, well ahead, on this same cadence.
+    if (engineAvailable(getConfig(), "claude")) checkClaudeRefreshExpiry();
     void collectEngineLimits(getConfig())
       .then(() => {
         const unhealthy = Object.entries(readEngineHealth())

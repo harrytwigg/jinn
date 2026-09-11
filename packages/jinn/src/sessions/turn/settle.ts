@@ -18,6 +18,7 @@ import {
   withUnseenInterruptedPromptsCleared,
 } from "./superseded.js";
 import { shouldPersistFinalAssistantMessage, turnDisplayText } from "./text.js";
+import type { EngineResult } from "../../shared/types.js";
 import type { TurnInput, TurnRun, TurnSurface } from "./types.js";
 
 /** Preflight refused: record the reason everywhere the turn would have landed. */
@@ -85,11 +86,16 @@ export async function settleAnsweredTurn(
   clearSupersededTurnMeta(sessionId);
   if (settled && displayText) await run.surface.reply(displayText);
 
-  logger.info(
-    `Session ${sessionId} completed` +
-    (result.durationMs ? ` in ${result.durationMs}ms` : "") +
-    (result.cost ? ` ($${result.cost.toFixed(4)})` : ""),
-  );
+  logSettledTurn(sessionId, result, quietPreempted);
+}
+
+/** The receipt already records a failed turn as `failed`; the log line has to
+ *  agree, or an outage reads as a run of completions to anyone grepping it. */
+function logSettledTurn(sessionId: string, result: EngineResult, quietPreempted: boolean): void {
+  const timing = (result.durationMs ? ` in ${result.durationMs}ms` : "") + (result.cost ? ` ($${result.cost.toFixed(4)})` : "");
+  if (quietPreempted) logger.info(`Session ${sessionId} interrupted${timing}`);
+  else if (result.error) logger.error(`Session ${sessionId} failed${timing}: ${result.error}`);
+  else logger.info(`Session ${sessionId} completed${timing}`);
 }
 
 function answeredMessageMeta(run: TurnRun, attempt: EngineAttempt) {

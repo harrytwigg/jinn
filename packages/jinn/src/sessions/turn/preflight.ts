@@ -1,5 +1,6 @@
 import { buildPlatformContextRefresh, fingerprintPlatformContext } from "../../engines/platform-context.js";
 import { isBudgetExhausted } from "../../gateway/budgets.js";
+import { refuseClaudeLaunch } from "../claude-auth-watch.js";
 import { resolveEffort } from "../../shared/effort.js";
 import { logger } from "../../shared/logger.js";
 import { effortLevelsForModel, engineAvailable, engineUnavailableMessage, isKnownEngine } from "../../shared/models.js";
@@ -54,7 +55,18 @@ function refuseTurn(input: TurnInput): string | undefined {
   if (session.employee && isBudgetExhausted(session.employee, input.config.budgets?.employees)) {
     return `Budget limit exceeded for employee "${session.employee}". Session blocked.`;
   }
-  return undefined;
+  return refuseDeadClaudeLogin(input);
+}
+
+/**
+ * Last, because it reads a file: a Claude launch on credentials a launch has
+ * already proved dead (or that the disk says cannot work) costs a spawn and a
+ * guaranteed `authentication_failed`, and says nothing new. The PTY view's
+ * engine override is a human at a terminal who can read the error themselves.
+ */
+function refuseDeadClaudeLogin(input: TurnInput): string | undefined {
+  if (input.session.engine !== "claude" || input.engineOverride) return undefined;
+  return refuseClaudeLaunch(input.employee);
 }
 
 /**

@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import type { ModelInfo } from "./types.js";
 import { resolveClaudeConfigDir } from "./home.js";
+import { parseClaudeCredentials } from "./claude-auth.js";
 
 export const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 export const CLAUDE_ALIAS_IDS = ["opus", "sonnet", "fable"] as const;
@@ -238,21 +239,10 @@ export async function discoverClaudeEffortLevels(bin: string): Promise<string[]>
  * credentials file, so both sources share this parser.
  */
 export function claudeTokenFromCredentialsJson(raw: string): string | undefined {
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
-    const token = typeof oauth?.accessToken === "string" ? oauth.accessToken.trim() : "";
-    if (!token) return undefined;
-    const expiresAt = oauth?.expiresAt;
-    if (typeof expiresAt === "number" && expiresAt > 0 && expiresAt <= Date.now()) return undefined;
-    if (typeof expiresAt === "string") {
-      const ms = Date.parse(expiresAt);
-      if (Number.isFinite(ms) && ms <= Date.now()) return undefined;
-    }
-    return token;
-  } catch {
-    return undefined;
-  }
+  const creds = parseClaudeCredentials(raw);
+  if (!creds?.accessToken) return undefined;
+  if (creds.accessExpiresAt !== undefined && creds.accessExpiresAt <= Date.now()) return undefined;
+  return creds.accessToken;
 }
 
 function tokenFromCredentialsFile(configDir: string): string | undefined {
