@@ -3,6 +3,7 @@ import { scanOrg } from "../gateway/org.js";
 import { employeeRemoteTarget, resolveRemoteClaudeConfigDir, sshDestination, validateRemoteTarget } from "../shared/remote-target.js";
 import { ensureRemoteReady, sendWakeOnLan, clearRemoteFactsCache } from "../engines/remote-stage.js";
 import type { RemoteTarget } from "../shared/types.js";
+import { engineSupportsRemote, REMOTE_ENGINE_NAMES } from "../shared/models.js";
 
 const GREEN = "\x1b[32m";
 const YELLOW = "\x1b[33m";
@@ -45,6 +46,10 @@ interface RemoteEmployee {
    *  to diagnose. */
   target: RemoteTarget;
   remoteCwd: string;
+  /** The engine this employee runs, as configured. Kept because it decides
+   *  which agent CLI the host must carry — a status line that probed for
+   *  `claude` on a Pi employee's desktop would report a working host broken. */
+  engine: string;
 }
 
 function remoteEmployees(config: ReturnType<typeof loadConfig>): RemoteEmployee[] {
@@ -58,6 +63,7 @@ function remoteEmployees(config: ReturnType<typeof loadConfig>): RemoteEmployee[
       destination: sshDestination(target as typeof target & { remoteHost: string }),
       target,
       remoteCwd: target.remoteCwd ?? "",
+      engine: employee.engine ?? config.engines.default,
     });
   }
   return out.sort((a, b) => a.name.localeCompare(b.name));
@@ -104,18 +110,29 @@ async function printEmployeeStatus(
     console.log(`${RED}✗ ${employee.name}${RESET} — ${problem.error}`);
     return;
   }
+  if (!engineSupportsRemote(employee.engine)) {
+    console.log(
+      `${RED}✗ ${employee.name}${RESET} — engine "${employee.engine}" has no remote support `
+      + `(remote employees run on ${REMOTE_ENGINE_NAMES.join(" or ")})`,
+    );
+    return;
+  }
   // Never wake from a status check: "is it up" must not have the side effect
   // of turning it on.
   clearRemoteFactsCache();
-  const readiness = await ensureRemoteReady(employee.target, remote, { allowWake: false });
+  const readiness = await ensureRemoteReady(employee.target, remote, { engine: employee.engine, allowWake: false });
   if (!readiness.ready) {
     console.log(`${YELLOW}✗ ${employee.name}${RESET} ${DIM}${employee.destination}${RESET} — ${readiness.reason}`);
     return;
   }
-  const profile = resolveRemoteClaudeConfigDir(employee.target, remote);
   console.log(`${GREEN}✓ ${employee.name}${RESET} ${DIM}${employee.destination}:${employee.remoteCwd}${RESET}`);
   console.log(`  ${DIM}jinn ${readiness.facts.jinnVersion}, node ${readiness.facts.nodeBin}, home ${readiness.facts.stageDir}${RESET}`);
-  console.log(`  ${DIM}profile ${profile ?? "(default)"}, claude ${readiness.facts.claudeBin}${RESET}`);
+  if (employee.engine === "claude") {
+    const profile = resolveRemoteClaudeConfigDir(employee.target, remote);
+    console.log(`  ${DIM}profile ${profile ?? "(default)"}, claude ${readiness.facts.claudeBin}${RESET}`);
+  } else {
+    console.log(`  ${DIM}engine ${employee.engine}, pi ${readiness.facts.piBin}${RESET}`);
+  }
 }
 
 /** `jinn remote status [employee]` — what the turn path would find right now. */
@@ -168,7 +185,13 @@ export async function remoteWake(name?: string): Promise<void> {
     console.log(`${DIM}Wake-on-LAN sent to ${remote.wakeMac}.${RESET}`);
   }
   console.log(`Waiting for ${employee.destination}…`);
-  const readiness = await ensureRemoteReady(employee.target, remote, { allowWake: true });
+  const readiness = await ensureRemoteReady(employee.target, remote, {
+    // A wake asks a narrower question than a status check — "is the box up" —
+    // but readiness is readiness: the same toolchain check runs, so it is asked
+    // about the agent this employee actually runs.
+    engine: engineSupportsRemote(employee.engine) ? employee.engine : "claude",
+    allowWake: true,
+  });
   if (readiness.ready) {
     console.log(`${GREEN}✓ ${employee.destination} is ready.${RESET}`);
   } else {

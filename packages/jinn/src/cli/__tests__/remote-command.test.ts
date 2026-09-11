@@ -17,7 +17,13 @@ const hoisted = vi.hoisted(() => ({
 }));
 
 vi.mock("../../shared/config.js", () => ({
-  loadConfig: vi.fn(() => ({ remote: { root: "/srv/jinn-work", mount: "/mnt/jinn-home", wakeMac: "aa:bb:cc:dd:ee:ff" } })),
+  // `engines.default` is what an employee with no `engine:` of its own runs, and
+  // that is what decides which agent CLI the host is probed for — a real config
+  // always carries it.
+  loadConfig: vi.fn(() => ({
+    engines: { default: "claude" },
+    remote: { root: "/srv/jinn-work", mount: "/mnt/jinn-home", wakeMac: "aa:bb:cc:dd:ee:ff" },
+  })),
 }));
 
 vi.mock("../../gateway/org.js", () => ({

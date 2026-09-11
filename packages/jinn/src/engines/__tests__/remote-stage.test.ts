@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Pure-surface tests for the remote staging module. Nothing here touches SSH:
@@ -39,7 +40,9 @@ vi.mock("node:dgram", () => {
   return { default: { createSocket }, createSocket };
 });
 
-import { shq, buildSshSpawnArgs, sendWakeOnLan, FACTS_SCRIPT, FARM_SCRIPT, buildTrustSeedCommand, trustSeedKey, runLocalWakeCommand } from "../remote-stage.js";
+import { shq, buildSshSpawnArgs, sendWakeOnLan, FACTS_SCRIPT, FARM_SCRIPT, buildTrustSeedCommand, trustSeedKey, runLocalWakeCommand, requireRemoteEngineBin } from "../remote-stage.js";
+import { remotePiExtensionSource } from "../pi-mcp.js";
+import { JINN_HOME } from "../../shared/paths.js";
 
 const isWindows = process.platform === "win32";
 
@@ -97,8 +100,8 @@ function build(over: Partial<Parameters<typeof buildSshSpawnArgs>[0]> = {}): str
       CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "1",
     },
     unsetRemoteEnv: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDECODE"],
-    claudeBin: "/usr/local/bin/claude",
-    claudeArgs: ["--chrome", "--settings", "/mnt/jinn-home/.jinn-remote-stage/tmp/settings/sess-1.json"],
+    bin: "/usr/local/bin/claude",
+    args: ["--chrome", "--settings", "/mnt/jinn-home/.jinn-remote-stage/tmp/settings/sess-1.json"],
     ...over,
   });
 }
@@ -233,7 +236,7 @@ describe.skipIf(isWindows)("buildSshSpawnArgs — the remote command parsed by a
     const prompt = `'; rm -rf /; echo '`;
     const cmd = remoteCommandOf(build({
       remoteCwd: dir,
-      claudeArgs: ["--chrome", prompt],
+      args: ["--chrome", prompt],
       unsetRemoteEnv: ["ANTHROPIC_API_KEY"],
     }));
     const argv = remoteArgv(cmd, dir);
@@ -255,7 +258,7 @@ describe.skipIf(isWindows)("buildSshSpawnArgs — the remote command parsed by a
     const prompt = "line one $(id)\nline two `whoami` ${HOME} & echo done";
     const cmd = remoteCommandOf(build({
       remoteCwd: dir,
-      claudeArgs: ["-p", prompt],
+      args: ["-p", prompt],
       unsetRemoteEnv: [],
     }));
     const argv = remoteArgv(cmd, dir);
@@ -268,14 +271,14 @@ describe.skipIf(isWindows)("buildSshSpawnArgs — the remote command parsed by a
       remoteCwd: dir,
       remoteEnv: { JINN_SESSION_ID: `s'; id; echo '1` },
       unsetRemoteEnv: [],
-      claudeArgs: [],
+      args: [],
     }));
     const argv = remoteArgv(cmd, dir);
     expect(argv).toEqual([`JINN_SESSION_ID=s'; id; echo '1`, "/usr/local/bin/claude"]);
   });
 
   it("the `cd` really lands in the remoteCwd", () => {
-    const cmd = remoteCommandOf(build({ remoteCwd: dir, unsetRemoteEnv: [], claudeArgs: [] }));
+    const cmd = remoteCommandOf(build({ remoteCwd: dir, unsetRemoteEnv: [], args: [] }));
     const script = [
       `PATH=''`,
       `env() { printf '%s\\0' "$PWD"; }`,
@@ -400,6 +403,22 @@ describe.skipIf(process.platform === "win32")("FACTS_SCRIPT node resolution", ()
     expect(runFacts().node).toContain("v24.14.1");
   });
 
+  it("reports whichever agent CLIs the host has, without requiring either", () => {
+    // A host that runs only Pi employees has no reason to carry Claude Code —
+    // and the reverse. The probe reports what it finds; which of them is
+    // REQUIRED is a per-engine question, asked by requireRemoteEngineBin.
+    fakeNode("v22.22.3");
+    const binDir = path.join(home, "sysbin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const pi = path.join(binDir, "pi");
+    fs.writeFileSync(pi, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(pi, 0o755);
+
+    const kv = runFacts(`${binDir}:/usr/bin:/bin`);
+    expect(kv.pi).toBe(pi);
+    expect(kv.claude).toBe("");
+  });
+
   it("prefers a node already on PATH over anything under nvm", () => {
     fakeNode("v22.22.3");
     const realDir = path.join(home, "sysbin");
@@ -418,8 +437,8 @@ describe("buildSshSpawnArgs — remote PATH", () => {
     gatewayPort: 7777,
     remoteCwd: "/srv/jinn-work/main",
     remoteEnv: { JINN_HOME: "/home/u/.jinn-remote-stage" },
-    claudeBin: "/usr/bin/claude",
-    claudeArgs: ["--chrome"],
+    bin: "/usr/bin/claude",
+    args: ["--chrome"],
   };
 
   it("prepends the node directory so Claude Code's bare `node` hooks can run", () => {
@@ -611,12 +630,81 @@ describe.skipIf(isWindows)("buildSshSpawnArgs — the session secret file", () =
     // function would be invisible to it.
     const fakeClaude = path.join(dir, "fake-claude");
     fs.writeFileSync(fakeClaude, '#!/bin/sh\nprintf "%s|%s" "$JINN_GATEWAY_URL" "$JINN_GATEWAY_TOKEN"\n', { mode: 0o755 });
-    const cmd = remoteCommandOf(build({ envFile, remoteCwd: dir, claudeBin: fakeClaude, claudeArgs: [] }));
+    const cmd = remoteCommandOf(build({ envFile, remoteCwd: dir, bin: fakeClaude, args: [] }));
     // Run it for real. This is the claim that matters: the system prompt tells
     // every session both vars are already exported, and every documented curl —
     // delegation included — is dead if that is not true.
     const out = execFileSync("sh", ["-c", cmd.replace("exec env", "env")], { cwd: dir, encoding: "utf8" });
     expect(out).toBe("http://127.0.0.1:44321|secret-bearer-token");
+  });
+});
+
+/**
+ * Which agent CLI a host must carry is a property of the ENGINE the session
+ * runs, not of the host.
+ *
+ * Asserting it per host would make a desktop that runs Pi employees unusable
+ * over a Claude Code install nothing on it was ever going to start — and facts
+ * are cached per host and shared by every session on it, so the check has to
+ * live where the engine is known.
+ */
+describe("requireRemoteEngineBin", () => {
+  const FACTS = {
+    home: "/home/u",
+    stageDir: "/home/u/.jinn-remote-stage",
+    nodeBin: "/usr/bin/node",
+    piBin: "/usr/local/bin/pi",
+    jinnVersion: "0.32.0",
+    entryDir: "/usr/lib/jinn/dist/src/mcp",
+  };
+
+  it("returns the engine's own binary", () => {
+    expect(requireRemoteEngineBin("build-box", FACTS, "pi")).toBe("/usr/local/bin/pi");
+    expect(requireRemoteEngineBin("build-box", { ...FACTS, claudeBin: "/usr/local/bin/claude" }, "claude"))
+      .toBe("/usr/local/bin/claude");
+  });
+
+  it("does not refuse a Pi host for having no Claude Code on it", () => {
+    expect(() => requireRemoteEngineBin("build-box", FACTS, "pi")).not.toThrow();
+  });
+
+  it("names the host, the binary and how to check the PATH when one is missing", () => {
+    // A non-interactive ssh reads no rc file, so "not installed" is the wrong
+    // diagnosis far more often than it is the right one — the message has to
+    // say how to tell the two apart.
+    expect(() => requireRemoteEngineBin("build-box", FACTS, "claude"))
+      .toThrow(/build-box has no `claude`.*command -v claude/s);
+  });
+});
+
+/**
+ * Pi loads the company toolset from a generated module rather than an
+ * `--mcp-config`, and that module's imports are absolute paths.
+ *
+ * Staged verbatim they name the GATEWAY's dist — which is not on the other
+ * machine and is not what the mount carries — so the remote copy has to be
+ * regenerated against that host's own install.
+ */
+describe("remotePiExtensionSource", () => {
+  const ENTRY_DIR = "/home/u/.nvm/versions/node/v22.22.3/lib/node_modules/jinn-cli/dist/src/mcp";
+  const source = remotePiExtensionSource(ENTRY_DIR);
+
+  it("imports the built-in server and the tool projection from the REMOTE install", () => {
+    expect(source).toContain(`"file://${ENTRY_DIR}/server.js"`);
+    expect(source).toContain(`"file:///home/u/.nvm/versions/node/v22.22.3/lib/node_modules/jinn-cli/dist/src/engines/pi-mcp.js"`);
+  });
+
+  it("names no path belonging to the gateway that generated it", () => {
+    // The failure this guards is silent in the worst way: the extension simply
+    // fails to import, and pi runs the turn with none of the company tools.
+    expect(source).not.toContain(fileURLToPath(new URL("../pi-mcp.ts", import.meta.url)));
+    expect(source).not.toContain(JINN_HOME);
+  });
+
+  it("registers the same tools the local extension does", () => {
+    // Same generator, so the two cannot drift: only the two module URLs differ.
+    expect(source).toContain("pi.registerTool");
+    expect(source).toContain("notesEnabledFromConfig");
   });
 });
 
@@ -635,7 +723,7 @@ describe("trust seed — profile agreement", () => {
     home: "/home/u",
     stageDir: "/home/u/.jinn-remote-stage",
     nodeBin: "/usr/bin/node",
-    claudeBin: "/usr/local/bin/claude",
+    bin: "/usr/local/bin/claude",
     jinnVersion: "0.32.0",
     entryDir: "/usr/lib/jinn/src/mcp",
   };
