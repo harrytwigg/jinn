@@ -7,6 +7,7 @@ import type {
   EngineModelsConfig,
 } from "./types.js";
 import { logger } from "./logger.js";
+import { keepClaudeCatalogAfter, logClaudeCatalogShortfall, readClaudeCredentialStatus } from "./claude-auth.js";
 import { resolveBin, isInstalled } from "./resolve-bin.js";
 import { discoverPiModels } from "./pi-models.js";
 import {
@@ -143,37 +144,35 @@ let discoveredHermesModels: HermesModelDiscovery | null = null;
  * Discover Claude's catalog through Claude Code OAuth. This is best-effort and
  * read-only; it never validates a model by starting a Claude turn.
  */
-export async function refreshClaudeModels(config: JinnConfig): Promise<void> {
+export async function refreshClaudeModels(config: JinnConfig): Promise<boolean> {
   if (!engineAvailable(config, "claude")) {
     discoveredClaudeModels = null;
     discoveredClaudeEffortLevels = null;
     invalidateModelRegistry();
-    return;
+    return false;
   }
   try {
     const bin = resolveBin("claude", engineBinOverride(config, "claude"));
     discoveredClaudeEffortLevels = await discoverClaudeEffortLevels(bin);
-    discoveredClaudeModels = await discoverClaudeModels({
+    const discovered = await discoverClaudeModels({
       effortLevels: discoveredClaudeEffortLevels.length > 0 ? discoveredClaudeEffortLevels : undefined,
     });
-    // Zero models means no usable OAuth token (or an empty catalog), and the
-    // registry then silently falls back to the hardcoded "<Name> (Latest)"
-    // labels. Warn so that degradation is diagnosable instead of looking like a
-    // real catalog — this failure went unnoticed precisely because it was INFO.
-    if (discoveredClaudeModels.models.length === 0) {
-      logger.warn(
-        "Claude model discovery returned 0 models — no usable OAuth token; " +
-          "falling back to the offline alias catalog. Run `claude login` to restore real model names.",
-      );
-    } else {
-      logger.info(`Claude model discovery: ${discoveredClaudeModels.models.length} model(s)`);
+    // `true` = the catalog GET authenticated with the token on disk; the caller
+    // tells the auth watch, which this module must not import. On zero models
+    // the last good catalog is kept — the models did not stop existing because
+    // the token lapsed — and the credential reader says whether a login is the fix.
+    if (discovered.models.length > 0) {
+      discoveredClaudeModels = discovered;
+      logger.info(`Claude model discovery: ${discovered.models.length} model(s)`);
+      return true;
     }
+    logClaudeCatalogShortfall(readClaudeCredentialStatus(), discoveredClaudeModels !== null);
   } catch (err) {
-    logger.warn(`Claude model discovery failed: ${err instanceof Error ? err.message : err}`);
-    discoveredClaudeModels = null;
+    discoveredClaudeModels = keepClaudeCatalogAfter(err, discoveredClaudeModels, readClaudeCredentialStatus());
   } finally {
     invalidateModelRegistry();
   }
+  return false;
 }
 
 export function setDiscoveredClaudeModelsForTest(models: ClaudeModelDiscovery | null): void {

@@ -10,7 +10,6 @@ import {
   listPendingSessionDeliveries,
   markDelegationCompletionSurfaced,
 } from "./registry.js";
-import { loadConfig } from "../shared/config.js";
 import { logger } from "../shared/logger.js";
 import { STRUCTURED_MESSAGE_BODY_MAX_CHARS, type Session } from "../shared/types.js";
 import type { ChatBlockEnvelope, JsonObject } from "../shared/types.js";
@@ -439,44 +438,7 @@ function _clean(text: string, max: number): string {
   return (lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd() + "…";
 }
 
-/**
- * Send a fixed notification to the operator's configured channel
- * (`notifications.connector` + `notifications.channel`; Discord by default).
- * Used for alerts that must reach a human without depending on an LLM — rate
- * limits, and a workflow parked on a decision with no employee session to wake.
- * Fire-and-forget — errors are logged but never rethrown.
- */
-export function notifyOperatorChannel(message: string): void {
-  _sendOperatorNotification(message).catch((err) => {
-    logger.warn(`[callbacks] Failed to send operator notification: ${err instanceof Error ? err.message : String(err)}`);
-  });
-}
-
-async function _sendOperatorNotification(message: string): Promise<void> {
-  let connector = "discord";
-  let channel: string | undefined;
-  const gateway = internalGatewayConnection();
-
-  try {
-    const config = loadConfig();
-    connector = config.notifications?.connector || "discord";
-    channel = config.notifications?.channel;
-  } catch {
-    // Use defaults if config is unavailable
-  }
-
-  if (!channel) {
-    logger.debug("[callbacks] No notifications.channel configured — skipping operator notification");
-    return;
-  }
-
-  const response = await fetch(`${gateway.baseUrl}/api/connectors/${connector}/send`, {
-    method: "POST",
-    headers: internalGatewayHeaders(gateway),
-    body: JSON.stringify({ channel, text: message }),
-  });
-  if (!response.ok) throw new Error(`connector notification failed (${response.status})`);
-}
+export { notifyOperatorChannel } from "./operator-notification.js";
 
 async function _sendRaw(
   parentSessionId: string,

@@ -313,10 +313,10 @@ portal:
 #     enabled: true
 #     tokenThreshold: 300000
 #     staleAfterMinutes: 60
-# Cron alerting — route failed scheduled jobs to a connector channel.
-# cron:
-#   alertConnector: slack
-#   alertChannel: "#alerts"
+# Alerts. Failed cron jobs go to cron.alert*. LLM-free operator alerts (usage limits, a dead
+# Claude login) go to notifications.*, else cron.alert*, else a single-user Telegram allowlist.
+# cron: { alertConnector: slack, alertChannel: "#alerts" }
+# notifications: { connector: telegram, channel: "123456789" }   # chat id / channel id / #channel
 
 logging:
   file: true

@@ -1,5 +1,6 @@
 import { logger } from "../../shared/logger.js";
 import { detectRateLimit, isDeadSessionError } from "../../shared/rateLimit.js";
+import { observeClaudeTurnOutcome } from "../claude-auth-watch.js";
 import type { EngineResult, Session } from "../../shared/types.js";
 import { completedStreamedBlockIds } from "../../gateway/streamed-blocks.js";
 import {
@@ -124,6 +125,19 @@ function wasQuietlyPreempted(run: TurnRun, live: Session, result: EngineResult, 
   return superseded;
 }
 
+/**
+ * What this turn said about the login it ran under, so the second auth failure
+ * of an outage is counted and the first is alerted. A preempted, dead-session
+ * or rate-limited turn says nothing either way.
+ */
+function noteClaudeLogin(run: TurnRun, result: EngineResult, silent: boolean): void {
+  if (run.plan.engineName !== "claude" || silent) return;
+  // A clean turn that produced nothing and cost nothing (a native `/command`)
+  // never reached the API, so it is no evidence the login works.
+  if (!result.error && !result.result?.trim() && !result.cost) return;
+  observeClaudeTurnOutcome(run.input.employee, result.error);
+}
+
 /** Settle whichever terminal class this turn landed in. */
 async function concludeTurn(run: TurnRun, attempt: EngineAttempt, model: string | undefined): Promise<void> {
   const sessionId = run.input.session.id;
@@ -139,6 +153,7 @@ async function concludeTurn(run: TurnRun, attempt: EngineAttempt, model: string 
   const dead = !quietPreempted && isDeadSessionError(result);
   if (dead) clearDeadEngineSession(sessionId, run.plan.engineName);
   const rateLimit = !quietPreempted && !dead ? detectRateLimit(result) : { limited: false as const };
+  noteClaudeLogin(run, result, quietPreempted || dead || rateLimit.limited);
 
   // Keep the same completed evidence the live view kept — interim prose, tools,
   // media, delegation blocks — and drop exact streamed copies of the result,
