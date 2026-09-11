@@ -1,9 +1,14 @@
 # Remote (SSH) execution
 
-By default every employee's Claude Code session is spawned as a real interactive
-TUI on the machine running the gateway. An employee that declares a `remoteHost`
-is spawned through `ssh` on another machine instead, and everything it does —
-repository checkouts, builds, tests — happens there.
+By default every employee's session is spawned on the machine running the
+gateway — Claude Code as a real interactive TUI, Pi as a headless JSON run. An
+employee that declares a `remoteHost` is spawned through `ssh` on another machine
+instead, and everything it does — repository checkouts, builds, tests — happens
+there.
+
+Two engines can do this: **`claude`** and **`pi`**. Every other engine ignores
+`remoteHost`, and a remote employee configured with one has its turns refused
+rather than silently run on the gateway.
 
 The motivating case is a gateway on a small always-on box (a Raspberry Pi, a
 NAS, a cheap VPS) driving a powerful desktop that does the actual work. No
@@ -21,19 +26,26 @@ A remote employee is a full employee, not a degraded one:
 | Todos, Notes, work items, delegation, knowledge reads | The gateway, via the built-in `jinn` MCP server over the tunnel |
 | Skills, `docs/`, `knowledge/`, `org/`, `secrets/` | The gateway, via the mounted instance home |
 | Hooks (turn completion, tool events, safety prompts) | Delivered to the gateway over the reverse tunnel |
-| The dashboard's live terminal view | Attached to the remote PTY |
+| The dashboard's live terminal view | Attached to the remote PTY (`claude`; Pi has no terminal view anywhere) |
 | Repository code, builds, tests, scratch files | The remote host — the point of the feature |
 
-The one deliberate omission is **live token-by-token streaming**. A remote
-session runs without the per-PTY SSE proxy, so the chat pane fills in when the
-turn ends rather than as it goes. Turn results, hook-driven tool activity, and
-blocked-on-a-question notifications are unaffected.
+The one deliberate omission is **live token-by-token streaming**, and it applies
+to `claude` only: a remote Claude session runs without the per-PTY SSE proxy, so
+the chat pane fills in when the turn ends rather than as it goes. Turn results,
+hook-driven tool activity, and blocked-on-a-question notifications are
+unaffected. A remote Pi session loses nothing here — its events come back over
+the same stdout stream a local one reads, so streaming works exactly as it does
+locally.
 
 ## Prerequisites on the remote host
 
-1. **Claude Code**, installed and signed in on the same plan the gateway uses.
-   If the host uses a profile manager, see *Choosing a Claude Code profile*
-   below — do not point Jinn at the wrapper script.
+1. **The agent CLI the employee's engine runs**, and only that one — a host that
+   runs Pi employees needs no Claude Code, and vice versa.
+   - `claude`: **Claude Code**, installed and signed in on the same plan the
+     gateway uses. If the host uses a profile manager, see *Choosing a Claude
+     Code profile* below — do not point Jinn at the wrapper script.
+   - `pi`: **the Pi CLI**, with its providers configured in that host's
+     `~/.pi/agent/models.json`. See *Running Pi remotely* below.
 2. **Node.js**. Note the PATH caveat below — this is the single most likely
    thing to bite you.
 3. **`jinn-cli` at the gateway's exact version**, installed globally:
@@ -78,7 +90,10 @@ default PATH:
 ln -s "$(command -v node)" ~/.local/bin/node
 ```
 
-Verify with `ssh <host> 'command -v node claude jinn'` — all three must print.
+Verify with `ssh <host> 'command -v node jinn'`, plus `claude` or `pi` for the
+engine that employee runs — each must print. `pi` needs this as much as Claude
+Code does: it is an npm-installed CLI, so its shebang resolves `node` through
+PATH, and a version-managed host gives a non-interactive ssh none.
 
 5. **Key-only SSH from the gateway.** Sessions run with `BatchMode=yes`, so a
    passphrase-locked key with no agent will simply fail. The host key must
@@ -172,7 +187,103 @@ When no profile is configured, `CLAUDE_CONFIG_DIR` is actively *unset* for the
 session, so a stray value in the remote environment cannot silently choose the
 credentials and trust state a session runs with.
 
-`jinn remote status` prints the resolved profile per employee.
+`jinn remote status` prints the resolved profile per employee. None of this
+applies to a Pi employee: Pi has no profile of its own to be signed out of, so
+the profile checks are skipped for it rather than refusing a host over a Claude
+Code install it never touches.
+
+## Running Pi remotely
+
+Pi is the second engine that can be relocated, and the motivating case is the
+mirror image of the gateway's: the desktop has the GPU and the local models, and
+the Raspberry Pi orchestrating it has neither.
+
+```yaml
+name: hound
+displayName: Hound
+department: engineering
+engine: pi
+model: ollama/gemma4:12b   # the provider/id the REMOTE host serves
+remoteHost: build-box
+remoteUser: jinn
+remoteCwd: /srv/jinn-work/main
+```
+
+The model id names a provider configured on the **remote** host's
+`~/.pi/agent/models.json` — that machine is the one running the inference, so it
+is the one whose providers matter. The gateway never assumes Ollama or any
+specific backend.
+
+The transport is the same `ssh` one Claude sessions use, and Pi rides it well:
+its protocol is a prompt on stdin and newline-delimited JSON on stdout, and both
+halves cross the connection untouched. Three differences from a remote Claude
+session, all of them consequences of Pi being a batch engine rather than a TUI:
+
+- **No remote pseudo-terminal.** The session is spawned with `ssh -T`, not
+  `-tt`, so the remote process's stderr stays a separate stream instead of being
+  folded into the JSON the engine parses.
+- **No hooks, and no folder-trust seed.** Pi reports its result on the same
+  stream it reports everything else, so nothing has to come back out of band —
+  and it has no first-run dialog to pre-empt. The reverse tunnel is still opened,
+  because the company toolset needs it (below).
+- **The company toolset arrives as a generated extension, not an
+  `--mcp-config`.** Pi loads the built-in `jinn` server as a module running
+  in-process, and that module's imports are absolute paths. The remote copy is
+  regenerated against the remote install's own `jinn-cli` — which is why the
+  version match is enforced there too — and reaches the gateway over the same
+  reverse tunnel, with the bearer staged in a 0600 file rather than put on a
+  command line.
+
+One asymmetry worth stating plainly. A remote Claude session has
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` stripped
+from the remote login environment, because an inherited key there would silently
+move a subscription session onto metered API billing. **A remote Pi session does
+not strip them**, and that is deliberate: Pi has no subscription auth to fall off
+— it drives whatever provider the operator configured, and for an `anthropic`
+provider an inherited key is how it works at all. What a Pi session does strip is
+exactly what a local one strips: the markers that tell a nested CLI it is running
+inside another agent.
+
+## Pi as the fallback when Claude hits its limit
+
+An engine's `fallback` chain works for remote employees, with one rule: a
+substitute must be an engine that can follow the session onto its host.
+
+```yaml
+engines:
+  pi:
+    # The default a substituted turn runs on, and — on a gateway with no Pi CLI
+    # of its own — the only model id the registry knows pi serves.
+    model: ollama/gemma4:12b
+  claude:
+    fallback: [pi]
+    # Optional, and usually unnecessary: which model survives the swap. Without
+    # a mapping the pin is simply dropped and pi runs on `engines.pi.model`,
+    # which is the right answer nearly always — a model id belongs to exactly
+    # one provider, so carrying an Anthropic pin across is how a swap ends in
+    # `model_not_found`. A target the registry does not list for pi is refused
+    # with a warning and falls back to the same default.
+    fallbackModelMap:
+      opus: ollama/gemma4:12b
+```
+
+With that, a remote Claude employee that hits an Anthropic usage limit hands the
+turn to Pi **on the same desktop**, against a model that machine serves locally,
+and carries on. Without it — or with a chain naming an engine that cannot go
+remote — the turn waits the limit out on the host that already owns the work,
+which is what it did before.
+
+Two things this gets right that are easy to get wrong:
+
+- **The substitute is told where to run.** A rate limit is the one moment a turn
+  is respawned rather than resumed, so the remote target is restated; otherwise
+  the fallback turn would quietly come back on the gateway.
+- **Availability is asked of the remote host, not the gateway.** A Raspberry Pi
+  orchestrator has no `pi` CLI on it and does not need one. The check reads what
+  the last spawn learned about the remote host's PATH; a host that has never been
+  probed is treated as unknown rather than as empty, so the substitution proceeds
+  and a genuinely missing binary is reported by the spawn, with the PATH
+  diagnosis this layer cannot give.
 
 ## Where the company's rules come from
 
@@ -316,9 +427,12 @@ because making that depend on somebody remembering to run a command would put
   towards over-blocking — it refuses when a write-shaped command mentions an
   offending path anywhere, not only as its target — which is the safe direction
   for a rule of this kind.
-- **Only the `claude` engine can go remote.** Every other engine ignores
-  `remoteHost`, so a remote employee configured with one has its turns refused
-  rather than silently run on the gateway.
+- **Only the `claude` and `pi` engines can go remote.** Every other engine
+  ignores `remoteHost`, so a remote employee configured with one has its turns
+  refused rather than silently run on the gateway. `jinn remote status` says so
+  per employee.
+- **A remote Pi turn has no dashboard terminal view**, because a Pi turn has none
+  locally either: it is a headless JSON run, not a TUI.
 - **Secrets reach a second machine.** The gateway's API bearer token and any MCP
   server API keys are staged into 0600 files on the remote host, and the mount
   makes the instance home — including `secrets/` — readable there. This is
