@@ -309,10 +309,12 @@ export class PiEngine implements InterruptibleEngine {
         // home — its own symlink farm over the mount, and its own gateway.json.
         JINN_HOME: staging.sessionHome,
         JINN_SESSION_ID: trackingId,
-        ...piJinnSessionEnv(opts.resolvedMcp),
       },
-      // JINN_GATEWAY_URL and the bearer, as a sourced 0600 file rather than
-      // argv: a remote command line is readable by every process on that host.
+      // The bearer, the gateway URL and this session's CAPABILITY, as a sourced
+      // 0600 file rather than argv: a remote command line is readable by every
+      // process on that host, and the capability authorizes acting as this
+      // session. Staged by prepareRemoteSession, which reads the same
+      // piJinnSessionEnv the local path passes straight into the child.
       envFile: staging.envFilePath,
       unsetRemoteEnv: PiEngine.REMOTE_ENV_DENY,
       // `pi` is an npm-installed CLI, so its shebang resolves `node` through

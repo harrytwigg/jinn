@@ -15,7 +15,7 @@ import type { RemoteTarget, ResolvedMcpConfig } from "../shared/types.js";
 import type { RemoteEngineName } from "../shared/models.js";
 import type { RemoteExecutionConfig } from "../shared/config-types.js";
 import { remapMcpConfigForRemote } from "../mcp/remote-config.js";
-import { piJinnMcpAttachable, remotePiExtensionSource } from "./pi-mcp.js";
+import { piJinnMcpAttachable, piJinnSessionEnv, remotePiExtensionSource } from "./pi-mcp.js";
 
 /**
  * Everything the gateway does to a remote host that is NOT the interactive
@@ -765,25 +765,37 @@ export function remoteRelayScript(facts: RemoteFacts): string {
   return path.posix.join(facts.stageDir, "hook-relay.mjs");
 }
 
-/** A remote session's own `$JINN_HOME`.
+/** A remote session's own `$JINN_HOME`, per session AND per engine.
  *
- *  Per SESSION, not per host, and that is load-bearing. `gateway.json` names
- *  the reverse-tunnel port, which is allocated per spawn — so a single shared
- *  copy means any second prepare rewrites the port another LIVE session's hook
- *  relay is about to read. The relay would then POST into a port with no tunnel
- *  behind it and, by design, swallow the failure: no Stop, no policy
- *  enforcement, and a turn that runs to completion while the gateway hears
- *  nothing. Giving each session its own home makes that collision impossible
- *  rather than unlikely. */
-export function remoteSessionHome(facts: RemoteFacts, jinnSessionId: string): string {
-  return path.posix.join(facts.stageDir, SESSIONS_DIR, safeSessionSegment(jinnSessionId));
+ *  Per SESSION because `gateway.json` names the reverse-tunnel port, which is
+ *  allocated per spawn — so a single shared copy means any second prepare
+ *  rewrites the port another LIVE session's hook relay is about to read. The
+ *  relay would then POST into a port with no tunnel behind it and, by design,
+ *  swallow the failure: no Stop, no policy enforcement, and a turn that runs to
+ *  completion while the gateway hears nothing.
+ *
+ *  Per ENGINE for exactly the same reason, once a session can change engine
+ *  mid-flight. A rate-limited Claude session is substituted onto pi WITHOUT its
+ *  PTY being released: that PTY stays warm, takes the next turn through
+ *  `injectPrompt` with no re-staging, and its relay re-reads `gateway.json` on
+ *  every hook. Sharing one home would have pi's prepare repoint the live Claude
+ *  session's relay at a tunnel that dies when pi's ssh exits. Locally the two
+ *  engines keep entirely separate state (Claude's own config dir, pi's
+ *  `--session-dir`); this is that same separation on the other machine.
+ *
+ *  Flat rather than nested under the session, because the stage reaper matches
+ *  `-mindepth 1 -maxdepth 1 -type d -mtime` (FARM_SCRIPT): a parent directory's
+ *  mtime does not move when a spawn writes inside it, so a nested layout would
+ *  put live sessions in front of the reaper. */
+export function remoteSessionHome(facts: RemoteFacts, jinnSessionId: string, engine: RemoteEngineName): string {
+  return path.posix.join(facts.stageDir, SESSIONS_DIR, safeSessionSegment(`${jinnSessionId}__${engine}`));
 }
 
 /** Session ids are gateway-generated and already path-safe; this is here so a
  *  hand-crafted one can never walk out of the sessions directory. */
-function safeSessionSegment(jinnSessionId: string): string {
-  const clean = String(jinnSessionId).replace(/[^A-Za-z0-9._-]/g, "_");
-  if (!clean || clean === "." || clean === "..") throw new Error(`unusable session id for remote staging: "${jinnSessionId}"`);
+function safeSessionSegment(segment: string): string {
+  const clean = String(segment).replace(/[^A-Za-z0-9._-]/g, "_");
+  if (!clean || clean === "." || clean === "..") throw new Error(`unusable session id for remote staging: "${segment}"`);
   return clean;
 }
 
@@ -1050,7 +1062,7 @@ export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts): Prom
   const { target, remote, facts, jinnSessionId, engine } = opts;
   assertRemoteTarget(target, remote);
   const destination = sshDestination(target);
-  const sessionHome = remoteSessionHome(facts, jinnSessionId);
+  const sessionHome = remoteSessionHome(facts, jinnSessionId, engine);
 
   // Only the two steps that touch per-HOST state are serialized; everything
   // below writes inside this session's own directory and cannot collide.
@@ -1068,7 +1080,14 @@ export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts): Prom
   const tunnelPort = await probeFreePort(destination, facts);
 
   await stageGatewayJson(destination, sessionHome, tunnelPort);
-  const envFilePath = await stageSessionEnvFile(destination, sessionHome, tunnelPort);
+  // The session identity pi's extension reads. Staged into the 0600 file rather
+  // than the remote command line for the same reason the bearer is.
+  const envFilePath = await stageSessionEnvFile(
+    destination,
+    sessionHome,
+    tunnelPort,
+    engine === "pi" ? piJinnSessionEnv(opts.resolvedMcp) : {},
+  );
   const base = { destination, tunnelPort, sessionHome, envFilePath };
 
   if (engine === "pi") {
@@ -1119,13 +1138,36 @@ async function stageGatewayJson(destination: string, sessionHome: string, tunnel
  * to every process on that host, and the bearer token is not something to put
  * in a process table.
  */
-async function stageSessionEnvFile(destination: string, sessionHome: string, tunnelPort: number): Promise<string> {
+async function stageSessionEnvFile(
+  destination: string,
+  sessionHome: string,
+  tunnelPort: number,
+  /** Further exports for this session's identity. Pi's belt travels here rather
+   *  than in the remote command, because `JINN_SESSION_CAPABILITY` authorizes
+   *  acting AS this session against the gateway and every remote command line is
+   *  readable in that host's process table. Claude's equivalent rides inside the
+   *  0600 staged mcp.json; this file is the same protection for an engine that
+   *  has no such file. */
+  extraExports: Record<string, string> = {},
+): Promise<string> {
   const info = readGatewayInfo(GATEWAY_INFO_FILE);
-  const lines = [`export JINN_GATEWAY_URL=${shq(`http://127.0.0.1:${tunnelPort}`)}`];
-  if (info?.token) lines.push(`export JINN_GATEWAY_TOKEN=${shq(info.token)}`);
   const envFilePath = path.posix.join(sessionHome, "tmp", "session-env.sh");
-  await stageRemoteFile(destination, envFilePath, `${lines.join("\n")}\n`);
+  await stageRemoteFile(destination, envFilePath, buildSessionEnvFile(tunnelPort, info?.token, extraExports));
   return envFilePath;
+}
+
+/** The sourceable fragment itself. Pure, and exported, so which values land in a
+ *  0600 file rather than on a world-readable command line is a testable claim
+ *  rather than an assertion about a function that needs two machines to run. */
+export function buildSessionEnvFile(
+  tunnelPort: number,
+  token: string | undefined,
+  extraExports: Record<string, string> = {},
+): string {
+  const lines = [`export JINN_GATEWAY_URL=${shq(`http://127.0.0.1:${tunnelPort}`)}`];
+  if (token) lines.push(`export JINN_GATEWAY_TOKEN=${shq(token)}`);
+  for (const [key, value] of Object.entries(extraExports)) lines.push(`export ${key}=${shq(value)}`);
+  return `${lines.join("\n")}\n`;
 }
 
 /** Reuse the real settings builder rather than reimplementing the hook set — it

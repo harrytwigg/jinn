@@ -40,7 +40,7 @@ vi.mock("node:dgram", () => {
   return { default: { createSocket }, createSocket };
 });
 
-import { shq, buildSshSpawnArgs, sendWakeOnLan, FACTS_SCRIPT, FARM_SCRIPT, buildTrustSeedCommand, trustSeedKey, runLocalWakeCommand, requireRemoteEngineBin } from "../remote-stage.js";
+import { shq, buildSshSpawnArgs, sendWakeOnLan, FACTS_SCRIPT, FARM_SCRIPT, buildTrustSeedCommand, trustSeedKey, runLocalWakeCommand, requireRemoteEngineBin, remoteSessionHome, buildSessionEnvFile } from "../remote-stage.js";
 import { remotePiExtensionSource } from "../pi-mcp.js";
 import { JINN_HOME } from "../../shared/paths.js";
 
@@ -636,6 +636,87 @@ describe.skipIf(isWindows)("buildSshSpawnArgs — the session secret file", () =
     // delegation included — is dead if that is not true.
     const out = execFileSync("sh", ["-c", cmd.replace("exec env", "env")], { cwd: dir, encoding: "utf8" });
     expect(out).toBe("http://127.0.0.1:44321|secret-bearer-token");
+  });
+});
+
+/**
+ * A session that changes engine mid-flight must not change another engine's
+ * staged home underneath it.
+ *
+ * The concrete failure: a rate-limited Claude session is substituted onto pi
+ * WITHOUT its PTY being released, so that PTY stays warm and takes the next turn
+ * with no re-staging — while its hook relay re-reads `gateway.json` on every
+ * hook. One shared home means pi's prepare rewrote the port behind it, and the
+ * relay then POSTs into a tunnel that died with pi's ssh. The relay swallows a
+ * failed POST by design, so the turn runs to completion with no Stop and nothing
+ * reported anywhere.
+ */
+describe("remoteSessionHome — per session AND per engine", () => {
+  const FACTS = {
+    home: "/home/u",
+    stageDir: "/home/u/.jinn-remote-stage",
+    nodeBin: "/usr/bin/node",
+    jinnVersion: "0.32.0",
+    entryDir: "/usr/lib/jinn/dist/src/mcp",
+  };
+
+  it("gives two engines on one session two different homes", () => {
+    const claude = remoteSessionHome(FACTS, "sess-1", "claude");
+    const pi = remoteSessionHome(FACTS, "sess-1", "pi");
+    expect(claude).not.toBe(pi);
+    // …and therefore two different gateway.json files, which is the whole point.
+    expect(path.posix.dirname(claude)).toBe(path.posix.dirname(pi));
+  });
+
+  it("keeps each home a single directory under sessions/, where the reaper looks", () => {
+    // FARM_SCRIPT reaps with `-mindepth 1 -maxdepth 1 -type d -mtime`. A nested
+    // <session>/<engine> layout would hide a live session's mtime behind a
+    // parent directory no spawn ever touches, and the reaper would delete a
+    // session that is still running.
+    const home = remoteSessionHome(FACTS, "sess-1", "pi");
+    const prefix = `${FACTS.stageDir}/sessions/`;
+    expect(home.startsWith(prefix)).toBe(true);
+    expect(home.slice(prefix.length)).not.toContain("/");
+  });
+
+  it("still cannot walk out of the sessions directory", () => {
+    expect(remoteSessionHome(FACTS, "../../etc", "pi")).toBe(`${FACTS.stageDir}/sessions/.._.._etc__pi`);
+  });
+});
+
+/**
+ * What goes in the 0600 file, and what is left on a command line every process
+ * on the remote host can read.
+ */
+describe("buildSessionEnvFile", () => {
+  it("keeps the bearer and the session capability out of argv", () => {
+    // JINN_SESSION_CAPABILITY authorizes acting AS this session against the
+    // gateway (mcp/identity.ts). Pi has no staged mcp.json to carry it the way
+    // Claude does, so this file is its equivalent — putting it in `remoteEnv`
+    // instead would inline it into the remote command, visible to `ps`.
+    const content = buildSessionEnvFile(44321, "secret-bearer", {
+      JINN_SESSION_ID: "sess-1",
+      JINN_SESSION_CAPABILITY: "cap-token",
+    });
+    expect(content).toContain("export JINN_GATEWAY_TOKEN='secret-bearer'");
+    expect(content).toContain("export JINN_SESSION_CAPABILITY='cap-token'");
+    expect(content).toContain("export JINN_GATEWAY_URL='http://127.0.0.1:44321'");
+  });
+
+  it("omits the bearer line entirely when the gateway has no token", () => {
+    expect(buildSessionEnvFile(44321, undefined)).not.toContain("JINN_GATEWAY_TOKEN");
+  });
+
+  // Through a REAL shell, because the claim is about what the remote `sh`
+  // makes of this file, not about what the string looks like here.
+  it.skipIf(process.platform === "win32")("delivers a hostile value intact rather than executing it", () => {
+    const hostile = "a'; touch /tmp/jinn-pwned; '";
+    const fragment = buildSessionEnvFile(44321, undefined, { JINN_SESSION_CAPABILITY: hostile });
+    const out = execFileSync("sh", ["-c", `${fragment}\nprintf '%s' "$JINN_SESSION_CAPABILITY"`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(out).toBe(hostile);
   });
 });
 

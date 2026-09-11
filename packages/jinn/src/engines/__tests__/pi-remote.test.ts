@@ -17,7 +17,9 @@ import { PassThrough, Writable } from "node:stream";
  * the child's stdin actually receives.
  */
 
-const REMOTE_HOME = "/home/builder/.jinn-remote-stage/sessions/sess-1";
+// Per session AND per engine: a substituted session must not restage the home
+// the engine it was substituted FROM is still reading gateway.json out of.
+const REMOTE_HOME = "/home/builder/.jinn-remote-stage/sessions/sess-1__pi";
 
 const hoisted = vi.hoisted(() => ({
   spawns: [] as { bin: string; args: string[]; opts: Record<string, unknown> }[],
@@ -222,6 +224,30 @@ describe("PiEngine — a remote employee's turn runs on the other machine", () =
     // Every remote command line is readable in that host's process table.
     expect(remoteCommand()).toContain(`. '${REMOTE_HOME}/tmp/session-env.sh'`);
     expect(remoteCommand()).not.toContain("JINN_GATEWAY_TOKEN=");
+  });
+
+  it("keeps this session's capability off the command line too", async () => {
+    // JINN_SESSION_CAPABILITY authorizes acting AS this session against the
+    // gateway API, so it belongs in the same 0600 file as the bearer — the
+    // remote Claude path carries its copy inside the staged mcp.json for the
+    // same reason. Inlined into `remoteEnv` it would be readable by every
+    // process on that host via ps.
+    const resolvedMcp = {
+      mcpServers: {
+        jinn: {
+          command: "/gateway/node",
+          args: ["/gateway/dist/src/mcp/server-entry.js"],
+          env: { JINN_SESSION_ID: "sess-1", JINN_SESSION_CAPABILITY: "cap-token-abc" },
+        },
+      },
+    } as unknown as EngineRunOpts["resolvedMcp"];
+
+    await engine().run(runOpts({ resolvedMcp }));
+
+    expect(remoteCommand()).not.toContain("cap-token-abc");
+    expect(remoteCommand()).not.toContain("JINN_SESSION_CAPABILITY");
+    // …and staging is handed the set it needs to put it in the file instead.
+    expect(hoisted.prepareCalls[0]!.resolvedMcp).toBe(resolvedMcp);
   });
 
   it("prepends the remote node directory, or pi's shebang finds no interpreter", async () => {
