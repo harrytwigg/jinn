@@ -152,6 +152,26 @@ describe("handleRateLimit — the retry spawn keeps the session on its remote ho
     expect(retryRun).toHaveBeenCalledWith(expect.objectContaining(REMOTE));
   });
 
+  it("keeps the employee's Claude profile on the retry, not the instance default", async () => {
+    // Dropping it does not fall back to "no profile": resolveRemoteClaudeConfigDir
+    // then returns the instance-wide remote.claudeConfigDir, so the respawn runs
+    // as a DIFFERENT profile from the one the session was staged and
+    // trust-seeded for — and the folder-trust dialog appears in front of a PTY
+    // with nobody at the keyboard.
+    engineAvailableMock.mockReturnValue(false);
+    const retryRun = answered("retried");
+
+    await handleRateLimit(makeOpts({
+      substituteRun: vi.fn(),
+      retryRun,
+      employee: employee({ ...REMOTE, remoteClaudeConfigDir: "/home/u/.claude-profiles/work" }),
+    }));
+
+    expect(retryRun).toHaveBeenCalledWith(
+      expect.objectContaining({ remoteClaudeConfigDir: "/home/u/.claude-profiles/work" }),
+    );
+  });
+
   it("forwards a remote target passed on the opts when no employee record carries one", async () => {
     engineAvailableMock.mockReturnValue(false);
     const retryRun = answered("retried");
@@ -306,6 +326,26 @@ describe("handleRateLimit — a remote employee only substitutes onto an engine 
 
     expect(substituteRun).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ kind: "resumed", result: { result: "retried-on-claude" } });
+  });
+
+  it("reports a substitute that fails to start, rather than stranding the session", async () => {
+    // By this point beginEngineSubstitution has already written "pi" onto the
+    // session, so a throw escaping handleRateLimit reaches the turn runner's
+    // catch, where claimSettleableSession compares the live engine against the
+    // plan's, finds them different, and drops the error as stale: no settle, no
+    // reply, and a session pinned at `running` forever. Every remote spawn
+    // throws on an unready host, so this is the ordinary case, not an exotic one.
+    const substituteRun = vi.fn(async () => { throw new Error("remote host not ready: build-box is not reachable"); });
+    const completions: EngineResult[] = [];
+
+    const outcome = await handleRateLimit({
+      ...makeOpts({ substituteRun, retryRun: vi.fn(), employee: employee(REMOTE), chain: "pi" }),
+      hooks: { onFallbackComplete: (result) => { completions.push(result); } },
+    });
+
+    expect(outcome.kind).toBe("fallback");
+    expect(completions).toHaveLength(1);
+    expect(completions[0]!.error).toContain("build-box is not reachable");
   });
 
   it("still substitutes when the host has never been probed — unknown is not absent", async () => {

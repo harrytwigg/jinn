@@ -24,7 +24,7 @@
  */
 
 import type { RateLimitHandlerOpts, RateLimitOutcome } from "./rate-limit-contract.js";
-import type { RemoteTarget } from "../shared/types.js";
+import type { Engine, EngineResult, RemoteTarget } from "../shared/types.js";
 import { isRemoteTarget, sshDestination } from "../shared/remote-target.js";
 import { JINN_HOME } from "../shared/paths.js";
 import { logger } from "../shared/logger.js";
@@ -48,6 +48,40 @@ export type {
 } from "./rate-limit-contract.js";
 
 /**
+ * Run the substitute, turning a thrown spawn into the error result every other
+ * engine failure already is.
+ *
+ * The catch is not defensive clutter — it closes a settle hole that only exists
+ * on this branch. `beginEngineSubstitution` has ALREADY written the substitute's
+ * name onto the session, so a throw escaping here reaches the turn runner's
+ * catch (`turn/runner.ts`), where `claimSettleableSession` compares the live
+ * `session.engine` against the plan's and finds them different — it drops the
+ * error as stale, `settleThrownTurn` never runs, and the session is left at
+ * `running` with nothing reported: the silent stall this whole path exists to
+ * avoid. Engines are entitled to throw (every CLI adapter rejects when its
+ * binary cannot be spawned, and the remote adapters throw when the host is not
+ * ready), so the fix belongs here, where the identity was changed.
+ *
+ * Reported as a result rather than swallowed into Branch B: the session has been
+ * flipped and the operator was already told a substitute is running, so the
+ * honest outcome is that substitute failing, with its reason.
+ */
+async function runSubstitute(
+  engine: Engine,
+  substituteName: EngineName,
+  sessionId: string,
+  opts: Parameters<Engine["run"]>[0],
+): Promise<EngineResult> {
+  try {
+    return await engine.run(opts);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error(`Session ${sessionId}: ${rateLimitEngineLabel(substituteName)} substitution failed to start: ${message}`);
+    return { sessionId: "", result: "", error: `${rateLimitEngineLabel(substituteName)} could not start: ${message}` };
+  }
+}
+
+/**
  * Drive the rate-limit recovery state machine. Returns once the situation
  * resolves (success, fallback completion, timeout, or cancellation).
  *
@@ -58,7 +92,7 @@ export async function handleRateLimit(opts: RateLimitHandlerOpts): Promise<RateL
   const {
     session, attemptToken, prompt, systemPrompt, platformContextRefresh, engineConfig, effortLevel, cliFlags,
     mcpConfigPath, resolvedMcp, attachments, config, engines, employee, engine,
-    remoteHost, remoteUser, remoteCwd, rateLimit, originalResult, hooks,
+    remoteHost, remoteUser, remoteCwd, remoteClaudeConfigDir, rateLimit, originalResult, hooks,
   } = opts;
 
   const engineLabel = rateLimitEngineLabel(session.engine);
@@ -70,6 +104,13 @@ export async function handleRateLimit(opts: RateLimitHandlerOpts): Promise<RateL
     remoteHost: employee?.remoteHost ?? remoteHost,
     remoteUser: employee?.remoteUser ?? remoteUser,
     remoteCwd: employee?.remoteCwd ?? remoteCwd,
+    // The profile travels too. Dropping it does not fall back to "no profile" —
+    // it falls back to the instance-wide `remote.claudeConfigDir`, so a respawn
+    // silently runs as a DIFFERENT Claude Code profile from the one the session
+    // was staged and trust-seeded for: `verifyClaudeProfile` then checks the
+    // wrong directory and the folder-trust dialog appears in front of a PTY with
+    // nobody at the keyboard (see resolveRemoteClaudeConfigDir).
+    remoteClaudeConfigDir: employee?.remoteClaudeConfigDir ?? remoteClaudeConfigDir,
   };
 
   // Both chain walkers read the generic record; Claude's store answers a different question.
@@ -126,7 +167,7 @@ export async function handleRateLimit(opts: RateLimitHandlerOpts): Promise<RateL
       ? prompt
       : `Continue this conversation and respond to the last USER message.\n\nConversation so far:\n\n${historyText}`;
 
-    const fallbackResult = await substituteEngine.run({
+    const fallbackResult = await runSubstitute(substituteEngine, substituteName, session.id, {
       prompt: fallbackPrompt,
       resumeSessionId: substituteResume,
       systemPrompt,
