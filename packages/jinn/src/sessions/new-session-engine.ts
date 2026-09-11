@@ -1,5 +1,6 @@
 import type { Employee, Engine, JinnConfig } from "../shared/types.js";
-import { engineAvailable, type EngineName } from "../shared/models.js";
+import { engineAvailable, engineSupportsRemote, type EngineName } from "../shared/models.js";
+import { isRemoteTarget } from "../shared/remote-target.js";
 import { preferHealthySessionEngine, readEngineHealth } from "../shared/engine-health.js";
 
 /** What a routed turn brought with it about where the session should run. */
@@ -42,12 +43,18 @@ export function newSessionEngineSelection(
 ): { engine: EngineName; model?: string; effortLevel?: string } {
   const preferred = (preference.engine ?? preference.employee?.engine ?? config.engines.default) as EngineName;
   const named = preference.engine !== undefined || preference.model !== undefined;
+  // A remote employee's preference may only be reordered within the engines that
+  // can actually run on its host. Rerouting it onto one that ignores
+  // `remoteHost` would start the session on an engine whose every turn the
+  // remote gate then refuses — a session that looks started and can never run.
+  const remote = isRemoteTarget(preference.employee);
   const engine = named
     ? preferred
     : preferHealthySessionEngine(
       config,
       preferred,
-      (candidate) => engines.has(candidate) && engineAvailable(config, candidate),
+      (candidate) => engines.has(candidate) && engineAvailable(config, candidate)
+        && (!remote || engineSupportsRemote(candidate)),
       readEngineHealth(),
     );
   return { engine, ...inheritedDefaults(preference, engine !== preferred) };

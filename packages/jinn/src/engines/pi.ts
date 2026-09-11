@@ -2,13 +2,23 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import type { InterruptibleEngine, EngineRunOpts, EngineResult } from "../shared/types.js";
+import type { InterruptibleEngine, EngineRunOpts, EngineResult, StreamDelta } from "../shared/types.js";
 import { logger } from "../shared/logger.js";
 import { resolveBin } from "../shared/resolve-bin.js";
 import { JINN_HOME } from "../shared/paths.js";
 import { buildEngineChildEnv } from "../shared/child-env.js";
 import { cleanupPiJinnMcpExtension, piJinnSessionEnv, writePiJinnMcpExtension, type PiMcpExtensionHandle } from "./pi-mcp.js";
 import { extractActivityReceiptId } from "../shared/activity-receipts.js";
+import { assertRemoteTarget, isRemoteTarget } from "../shared/remote-target.js";
+import type { RemoteExecutionConfig } from "../shared/config-types.js";
+import {
+  buildSshSpawnArgs,
+  ensureRemoteReady,
+  prepareRemoteSession,
+  remoteNodeDir,
+  remoteSessionBinDir,
+  requireRemoteEngineBin,
+} from "./remote-stage.js";
 
 interface LiveProcess {
   proc: ChildProcess;
@@ -28,6 +38,71 @@ interface LiveProcess {
 const STDERR_MAX = 10 * 1024; // 10KB rolling window for error reporting
 const TURN_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 const AGENT_END_EXIT_GRACE_MS = 5000;
+
+/** The prompt as pi will receive it on stdin: the system prompt on a first turn,
+ *  and any attachment paths appended. Shared by both transports so a remote turn
+ *  cannot drift into being prompted differently from a local one. */
+function buildPiPrompt(opts: EngineRunOpts): string {
+  let prompt = opts.prompt;
+  if (opts.systemPrompt && !opts.resumeSessionId) {
+    prompt = opts.systemPrompt + "\n\n---\n\n" + prompt;
+  }
+  if (opts.attachments?.length) {
+    prompt += "\n\nAttached files:\n" + opts.attachments.map((a) => `- ${a}`).join("\n");
+  }
+  return prompt;
+}
+
+/** Registry model ids are `provider/id`; split on the FIRST slash, since the
+ *  provider-native id may itself contain slashes (e.g. "ollama/hf.co/org/m:Q4"). */
+function splitProviderModel(rawModel: string): { provider?: string; model: string } {
+  const slash = rawModel.indexOf("/");
+  if (slash <= 0) return { model: rawModel };
+  return { provider: rawModel.slice(0, slash), model: rawModel.slice(slash + 1) };
+}
+
+function piModel(opts: EngineRunOpts): { provider?: string; model: string } {
+  return splitProviderModel(opts.model || "ollama/gemma4:12b");
+}
+
+/**
+ * pi's argv, minus the prompt.
+ *
+ * The two paths differ only in which machine's paths `sessionDir` and
+ * `extensionPath` name, which is why they are parameters rather than being
+ * resolved in here: everything else about a remote turn — provider, model,
+ * thinking level, the session id that makes `--resume` work — is identical to a
+ * local one, and a second copy of this list is how that would stop being true.
+ */
+function buildPiArgs(
+  opts: EngineRunOpts,
+  paths: { piSessionId: string; sessionDir: string; extensionPath?: string },
+): string[] {
+  const { provider, model } = piModel(opts);
+  const args: string[] = [];
+  if (provider) args.push("--provider", provider);
+  args.push("--model", model, "-p", "--mode", "json");
+  // Effort → Pi thinking level. Only reasoning-capable models ever carry an
+  // effort level (the registry exposes effortLevels for those models only), so
+  // passing it through verbatim is safe — mirrors codex/claude.
+  if (opts.effortLevel && opts.effortLevel !== "default") {
+    args.push("--thinking", opts.effortLevel);
+  }
+  args.push("--session-id", paths.piSessionId, "--session-dir", paths.sessionDir);
+  if (paths.extensionPath) args.push("--extension", paths.extensionPath);
+  if (opts.cliFlags?.length) args.push(...opts.cliFlags);
+  // The prompt goes over stdin, never argv: pi reads any dash-leading token as an
+  // option ("Unknown option: -") and has no `--` separator to escape it, so a
+  // prompt like "- " would kill the turn before the model saw it.
+  return args;
+}
+
+/** The provider/model/thinking triple, for a log line. */
+function describePiLaunch(opts: EngineRunOpts): string {
+  const { provider, model } = piModel(opts);
+  return `--provider ${provider ?? "(default)"} --model ${model}`
+    + `${opts.effortLevel && opts.effortLevel !== "default" ? ` --thinking ${opts.effortLevel}` : ""}`;
+}
 
 /**
  * Pi coding agent (https://pi.dev) run headlessly against a local model.
@@ -49,10 +124,27 @@ const AGENT_END_EXIT_GRACE_MS = 5000;
  * Provider/model: registry model ids are `provider/id` (e.g. "ollama/gemma4:12b").
  * The provider is whatever the user configured in their Pi `~/.pi/agent/models.json`
  * — the gateway never assumes Ollama or any specific backend.
+ *
+ * Remote: an employee carrying a `remoteHost` runs the same contract on another
+ * machine, with an `ssh` client standing in for the local process — the model,
+ * the providers and the repository are all that host's (see {@link runRemote}).
+ * This and the interactive Claude engine are the two adapters that can do that,
+ * which is what `REMOTE_ENGINE_NAMES` in shared/models.ts names.
  */
 export class PiEngine implements InterruptibleEngine {
   name = "pi" as const;
   private liveProcesses = new Map<string, LiveProcess>();
+
+  /** Live readers rather than captured values: config.yaml hot-reloads, and a
+   *  `remote` block edited while the daemon runs must take effect on the next
+   *  turn rather than at the next restart. Mirrors the interactive engine. */
+  private readRemoteConfig: () => RemoteExecutionConfig | undefined;
+  private readGatewayPort: () => number;
+
+  constructor(opts: { remote?: () => RemoteExecutionConfig | undefined; gatewayPort?: () => number } = {}) {
+    this.readRemoteConfig = opts.remote ?? (() => undefined);
+    this.readGatewayPort = opts.gatewayPort ?? (() => 0);
+  }
 
   kill(sessionId: string, reason = "Interrupted"): void {
     const live = this.liveProcesses.get(sessionId);
@@ -92,32 +184,32 @@ export class PiEngine implements InterruptibleEngine {
     return !!live && !live.proc.killed && live.proc.exitCode === null;
   }
 
+  /**
+   * Variables the REMOTE login environment must not carry into `pi`.
+   *
+   * Deliberately much shorter than the Claude engine's list, and the difference
+   * is not an oversight. Claude Code runs on subscription auth, so an inherited
+   * `ANTHROPIC_API_KEY` there would silently move the session onto metered
+   * billing — the one thing the PTY architecture exists to prevent. Pi has no
+   * subscription to fall off: it drives whatever provider the operator
+   * configured on that host, and for an `anthropic` provider an inherited key
+   * is how it works at all. Stripping it would break a working setup to protect
+   * a property Pi never had. What is stripped is exactly what
+   * `buildCleanEnv` strips locally: the markers that tell a nested CLI it is
+   * running inside another agent.
+   */
+  private static readonly REMOTE_ENV_DENY = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "JINN_HOME_IDENTITY", "JINN_TAKE_PORT"];
+
   async run(opts: EngineRunOpts): Promise<EngineResult> {
     const trackingId = opts.sessionId || `pi-${Date.now()}`;
     // A Pi session id keyed on the Jinn session → resuming reuses the same id and
     // continues the same Pi conversation.
     const piSessionId = opts.resumeSessionId || trackingId;
 
-    let prompt = opts.prompt;
-    if (opts.systemPrompt && !opts.resumeSessionId) {
-      prompt = opts.systemPrompt + "\n\n---\n\n" + prompt;
-    }
-    if (opts.attachments?.length) {
-      prompt += "\n\nAttached files:\n" + opts.attachments.map((a) => `- ${a}`).join("\n");
-    }
+    if (isRemoteTarget(opts)) return await this.runRemote(opts, trackingId, piSessionId);
 
+    const prompt = buildPiPrompt(opts);
     const bin = resolveBin("pi", opts.bin);
-
-    // Registry model ids are `provider/id`; split on the FIRST slash, since the
-    // provider-native id may itself contain slashes (e.g. "ollama/hf.co/org/m:Q4").
-    const rawModel = opts.model || "ollama/gemma4:12b";
-    let provider: string | undefined;
-    let model = rawModel;
-    const slash = rawModel.indexOf("/");
-    if (slash > 0) {
-      provider = rawModel.slice(0, slash);
-      model = rawModel.slice(slash + 1);
-    }
 
     // Isolate each session's Pi state so resumes are deterministic and concurrent
     // sessions never clobber each other.
@@ -128,36 +220,165 @@ export class PiEngine implements InterruptibleEngine {
       logger.error(`PiEngine failed to create session dir ${sessionDir}: ${err instanceof Error ? err.message : err}`);
     }
 
-    const args: string[] = [];
     const mcpExtension = writePiJinnMcpExtension(opts.resolvedMcp, trackingId);
-    if (provider) args.push("--provider", provider);
-    args.push("--model", model, "-p", "--mode", "json");
-    // Effort → Pi thinking level. Only reasoning-capable models ever carry an
-    // effort level (the registry exposes effortLevels for those models only), so
-    // passing it through verbatim is safe — mirrors codex/claude.
-    if (opts.effortLevel && opts.effortLevel !== "default") {
-      args.push("--thinking", opts.effortLevel);
-    }
-    args.push("--session-id", piSessionId, "--session-dir", sessionDir);
-    if (mcpExtension.attached) args.push("--extension", mcpExtension.extensionPath);
-    if (opts.cliFlags?.length) args.push(...opts.cliFlags);
-    // The prompt goes over stdin, never argv: pi reads any dash-leading token as an
-    // option ("Unknown option: -") and has no `--` separator to escape it, so a
-    // prompt like "- " would kill the turn before the model saw it.
+    const args = buildPiArgs(opts, {
+      piSessionId,
+      sessionDir,
+      ...(mcpExtension.attached ? { extensionPath: mcpExtension.extensionPath } : {}),
+    });
 
-    logger.info(
-      `Pi engine starting: ${bin} --provider ${provider ?? "(default)"} --model ${model}` +
-        `${opts.effortLevel && opts.effortLevel !== "default" ? ` --thinking ${opts.effortLevel}` : ""}` +
-        ` (resume: ${opts.resumeSessionId || "none"})`,
-    );
+    logger.info(`Pi engine starting: ${bin} ${describePiLaunch(opts)} (resume: ${opts.resumeSessionId || "none"})`);
 
     const cleanEnv = { ...this.buildCleanEnv(trackingId), ...piJinnSessionEnv(opts.resolvedMcp) };
 
+    return await this.launch({
+      trackingId,
+      sessionIdOut: piSessionId,
+      bin,
+      args,
+      env: cleanEnv,
+      cwd: opts.cwd,
+      prompt,
+      mcpExtension,
+      onStream: opts.onStream || null,
+    });
+  }
+
+  /**
+   * Run the turn on another machine: the same `pi -p --mode json` contract, with
+   * an `ssh` client standing in for the local process.
+   *
+   * What the substitution costs is nothing the parser can see. Pi's protocol is
+   * a prompt on stdin and newline-delimited JSON on stdout, and ssh carries both
+   * verbatim — which is exactly why the transport is worth reusing here rather
+   * than degrading a remote Pi employee into something less than a local one.
+   * The one flag that matters is `allocateTty: false`: with a tty the remote
+   * stderr would be folded into that JSON stream.
+   *
+   * The gateway-side process this engine owns, kills and times out is the local
+   * ssh client. When it dies the channel closes and sshd hangs up the remote
+   * command, so `kill()` still ends the turn on the other host.
+   */
+  private async runRemote(opts: EngineRunOpts, trackingId: string, piSessionId: string): Promise<EngineResult> {
+    if (opts.attachments?.length) {
+      // The paths buildPiPrompt would append are the GATEWAY's, and they name
+      // nothing on the other machine. A turn that silently references files the
+      // model cannot open is worse than one that refuses — same call the
+      // interactive engine makes for a remote Claude session.
+      return {
+        sessionId: piSessionId,
+        result: "",
+        error: "Attachments are not supported for remote employees — the file paths are local to the gateway",
+      };
+    }
+
+    const remote = this.readRemoteConfig();
+    assertRemoteTarget(opts, remote);
+    // Without a real gateway port the reverse forward would be built as
+    // `-R <n>:127.0.0.1:0`, and the jinn toolset would answer every call into
+    // nothing while the turn ran on regardless.
+    if (!this.readGatewayPort()) {
+      throw new Error("remote spawn needs the gateway's port for the reverse tunnel, and none was provided");
+    }
+    const readiness = await ensureRemoteReady(opts, remote, { engine: "pi", allowWake: false });
+    if (!readiness.ready) throw new Error(`remote host not ready: ${readiness.reason}`);
+    const facts = readiness.facts;
+
+    const staging = await prepareRemoteSession({
+      target: opts,
+      remote: remote!,
+      facts,
+      engine: "pi",
+      jinnSessionId: trackingId,
+      gatewayPort: this.readGatewayPort(),
+      ...(opts.resolvedMcp ? { resolvedMcp: opts.resolvedMcp } : {}),
+    });
+
+    const args = buildPiArgs(opts, {
+      piSessionId,
+      sessionDir: staging.piSessionDir,
+      ...(staging.piExtensionPath ? { extensionPath: staging.piExtensionPath } : {}),
+    });
+
+    const sshArgs = buildSshSpawnArgs({
+      destination: staging.destination,
+      tunnelPort: staging.tunnelPort,
+      gatewayPort: this.readGatewayPort(),
+      remoteCwd: opts.remoteCwd!,
+      remoteEnv: {
+        // Points the extension's in-process jinn server at THIS session's staged
+        // home — its own symlink farm over the mount, and its own gateway.json.
+        JINN_HOME: staging.sessionHome,
+        JINN_SESSION_ID: trackingId,
+      },
+      // The bearer, the gateway URL and this session's CAPABILITY, as a sourced
+      // 0600 file rather than argv: a remote command line is readable by every
+      // process on that host, and the capability authorizes acting as this
+      // session. Staged by prepareRemoteSession, which reads the same
+      // piJinnSessionEnv the local path passes straight into the child.
+      envFile: staging.envFilePath,
+      unsetRemoteEnv: PiEngine.REMOTE_ENV_DENY,
+      // `pi` is an npm-installed CLI, so its shebang resolves `node` through
+      // PATH — and a non-interactive ssh on a version-manager host has none.
+      // Without this the spawn dies with `env: node: No such file or directory`
+      // before pi prints a single line.
+      // Then the instance's own bin/, so the tools the operating instructions
+      // name bare — `mem` above all — resolve for a pi session exactly as they
+      // do for a Claude one.
+      pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(staging.sessionHome)],
+      bin: requireRemoteEngineBin(staging.destination, facts, "pi"),
+      args,
+      // No remote tty: pi's stdout is a JSON stream the engine parses line by
+      // line, and a tty would interleave the remote stderr into it.
+      allocateTty: false,
+    });
+
+    logger.info(
+      `Pi engine starting REMOTE on ${staging.destination}:${opts.remoteCwd} — ${describePiLaunch(opts)} `
+      + `(resume: ${opts.resumeSessionId || "none"}, tunnel: ${staging.tunnelPort}→${this.readGatewayPort()}, `
+      + `jinn tools: ${staging.piExtensionPath ? "on" : "off"})`,
+    );
+
+    return await this.launch({
+      trackingId,
+      sessionIdOut: piSessionId,
+      bin: resolveBin("ssh"),
+      args: sshArgs,
+      // The environment of the LOCAL ssh client. Everything the remote pi needs
+      // is inlined into the remote command instead — `env` never crosses a
+      // connection.
+      env: this.buildCleanEnv(trackingId),
+      // The ssh client's own cwd, irrelevant to the session: the remote command
+      // opens with a `cd` into remoteCwd.
+      cwd: JINN_HOME,
+      prompt: buildPiPrompt(opts),
+      onStream: opts.onStream || null,
+    });
+  }
+
+  /** Spawn one pi run — local or over ssh — and resolve when it settles.
+   *  Everything below this line is transport-agnostic: it reads the same JSON
+   *  event stream either way. */
+  private launch(params: {
+    trackingId: string;
+    sessionIdOut: string;
+    bin: string;
+    args: string[];
+    env: Record<string, string>;
+    cwd: string;
+    prompt: string;
+    mcpExtension?: PiMcpExtensionHandle;
+    onStream: ((delta: StreamDelta) => void) | null;
+  }): Promise<EngineResult> {
+    const { trackingId, bin, args, prompt, onStream } = params;
     return new Promise((resolve, reject) => {
       const proc = spawn(bin, args, {
-        cwd: opts.cwd,
-        env: cleanEnv,
+        cwd: params.cwd,
+        env: params.env,
         stdio: ["pipe", "pipe", "pipe"],
+        // Own the whole group so a kill reaches every child. For a remote run
+        // the group is the local ssh client's; sshd hangs up the remote command
+        // when its channel closes.
         detached: process.platform !== "win32",
       });
 
@@ -184,8 +405,8 @@ export class PiEngine implements InterruptibleEngine {
         stderr: "",
         settled: false,
         resolve,
-        sessionIdOut: piSessionId,
-        mcpExtension,
+        sessionIdOut: params.sessionIdOut,
+        ...(params.mcpExtension ? { mcpExtension: params.mcpExtension } : {}),
       };
       this.liveProcesses.set(trackingId, live);
       live.hardTimeout = setTimeout(() => {
@@ -199,8 +420,6 @@ export class PiEngine implements InterruptibleEngine {
         }, 2000).unref?.();
       }, TURN_TIMEOUT_MS);
       live.hardTimeout.unref?.();
-
-      const onStream = opts.onStream || null;
 
       rl.on("line", (line) => {
         const trimmed = line.trim();
@@ -284,9 +503,6 @@ export class PiEngine implements InterruptibleEngine {
         live.stderr = (live.stderr + chunk).slice(-STDERR_MAX);
         for (const l of chunk.trim().split("\n").filter(Boolean)) logger.debug(`[pi stderr] ${l}`);
       });
-
-      // -p mode reads the prompt from argv; no stdin input is needed.
-      proc.stdin.end();
 
       proc.on("close", (code) => this.settle(trackingId, code));
 

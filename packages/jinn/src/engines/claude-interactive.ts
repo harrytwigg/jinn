@@ -29,8 +29,9 @@ import {
   ensureRemoteReady,
   remoteNodeDir,
   prepareRemoteSession,
+  requireRemoteEngineBin,
   type RemoteFacts,
-  type RemoteSessionStaging,
+  type RemoteClaudeStaging,
 } from "./remote-stage.js";
 
 export type { PtyControlEvent } from "./pty-view-engine.js";
@@ -1668,7 +1669,7 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
    *  login environment plays that role). */
   private buildRemoteEnv(
     jinnSessionId: string,
-    staging: RemoteSessionStaging,
+    staging: RemoteClaudeStaging,
     claudeConfigDir: string | undefined,
   ): Record<string, string> {
     return {
@@ -1708,7 +1709,7 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
     target: RemoteTarget,
     resolvedMcp: ResolvedMcpConfig | undefined,
     beforeStage?: () => boolean,
-  ): Promise<{ facts: RemoteFacts; staging: RemoteSessionStaging; remote: RemoteExecutionConfig } | undefined> {
+  ): Promise<{ facts: RemoteFacts; staging: RemoteClaudeStaging; remote: RemoteExecutionConfig } | undefined> {
     const remote = this.readRemoteConfig();
     assertRemoteTarget(target, remote);
     // Without a real gateway port the reverse forward would be built as
@@ -1718,7 +1719,7 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
     if (!this.readGatewayPort()) {
       throw new Error("remote spawn needs the gateway's port for the reverse tunnel, and none was provided");
     }
-    const readiness = await ensureRemoteReady(target, remote, { allowWake: false });
+    const readiness = await ensureRemoteReady(target, remote, { engine: "claude", allowWake: false });
     if (!readiness.ready) throw new Error(`remote host not ready: ${readiness.reason}`);
     // Last chance to stand down without having written anything. Staging
     // rewrites this session's gateway.json with a freshly probed tunnel port,
@@ -1732,6 +1733,7 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
       target,
       remote: remote!,
       facts: readiness.facts,
+      engine: "claude",
       jinnSessionId,
       gatewayPort: this.readGatewayPort(),
       ...(resolvedMcp ? { resolvedMcp } : {}),
@@ -1782,9 +1784,9 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
       // turn hangs forever with nothing reported anywhere.
       // The node directory first (hooks run as bare `node`), then the
       // instance's own bin/ so `mem` and its neighbours resolve by name.
-      pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(facts, jinnSessionId)],
-      claudeBin: facts.claudeBin,
-      claudeArgs: args,
+      pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(staging.sessionHome)],
+      bin: requireRemoteEngineBin(staging.destination, facts, "claude"),
+      args,
     });
 
     const geom = this.lastGeom.get(jinnSessionId);
@@ -1917,9 +1919,9 @@ export class InteractiveClaudeEngine implements InterruptibleEngine, PtyViewEngi
             remoteEnv: this.buildRemoteEnv(jinnSessionId, staging, claudeConfigDir),
             envFile: staging.envFilePath,
             unsetRemoteEnv: InteractiveClaudeEngine.remoteEnvDeny(claudeConfigDir),
-            pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(facts, jinnSessionId)],
-            claudeBin: facts.claudeBin,
-            claudeArgs: baseArgs(staging.settingsPath),
+            pathPrepend: [remoteNodeDir(facts), remoteSessionBinDir(staging.sessionHome)],
+            bin: requireRemoteEngineBin(staging.destination, facts, "claude"),
+            args: baseArgs(staging.settingsPath),
           });
           logger.info(
             `InteractiveClaudeEngine ensureIdleSpawn REMOTE for session ${jinnSessionId} on `

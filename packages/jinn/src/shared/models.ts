@@ -58,6 +58,29 @@ export type EngineName = (typeof ENGINE_NAMES)[number];
 export const PTY_VIEW_ENGINE_NAMES = ["claude", "codex", "antigravity", "grok", "hermes"] as const; // engines with a /ws/pty view
 export type PtyViewEngineName = (typeof PTY_VIEW_ENGINE_NAMES)[number];
 
+/**
+ * Engines that know how to relocate a turn onto another machine over SSH.
+ *
+ * Membership is a property of the ENGINE ADAPTER, not of the CLI it drives:
+ * both of these branch on `remoteHost` and spawn `ssh` instead of their own
+ * binary (`claude-interactive.ts` `spawnRemote`, `pi.ts` `runRemote`). Every
+ * other adapter ignores the field entirely and would run the turn on the
+ * gateway — with `--dangerously-skip-permissions`, against a checkout that is
+ * not there — while the UI showed a remote employee working normally.
+ *
+ * Read by the turn gate (`sessions/turn/remote-ready.ts`), by the rate-limit
+ * substitution walker, and by the new-session engine preference, so that a
+ * remote employee is never handed to an engine that would silently bring the
+ * work back here.
+ */
+export const REMOTE_ENGINE_NAMES = ["claude", "pi"] as const;
+export type RemoteEngineName = (typeof REMOTE_ENGINE_NAMES)[number];
+
+/** Type guard: can `name`'s adapter run a turn on another host? */
+export function engineSupportsRemote(name: string): name is RemoteEngineName {
+  return (REMOTE_ENGINE_NAMES as readonly string[]).includes(name);
+}
+
 /** Binary name probed for each engine's availability (override via engines.<name>.bin). */
 const ENGINE_BIN: Record<EngineName, string> = {
   claude: "claude",

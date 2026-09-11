@@ -55,22 +55,41 @@ export function piJinnSessionEnv(resolvedMcp: ResolvedMcpConfig | undefined): Re
   } : {};
 }
 
+/**
+ * Whether this session's `jinn` server can be wired as a pi extension, warning
+ * once when the resolver attached one that pi cannot run.
+ *
+ * Shared by the local and the remote path so the two can never disagree about
+ * whether a session carries the belt — a remote session that quietly wrote no
+ * extension while the local one did would be a capability difference nobody
+ * could see in the UI.
+ */
+export function piJinnMcpAttachable(
+  resolvedMcp: ResolvedMcpConfig | undefined,
+  sessionId: string,
+): boolean {
+  if (jinnServer(resolvedMcp)) return true;
+  // A belt the resolver attached but pi cannot wire has to be said out loud: the
+  // turn still runs, the model just silently improvises around the missing tools.
+  const reason = unattachableJinnReason(resolvedMcp);
+  if (reason) logger.warn(`Pi engine is starting session ${sessionId} WITHOUT the jinn toolset: ${reason}`);
+  return false;
+}
+
 export function writePiJinnMcpExtension(
   resolvedMcp: ResolvedMcpConfig | undefined,
   sessionId: string,
 ): PiMcpExtensionHandle {
-  if (!jinnServer(resolvedMcp)) {
-    // A belt the resolver attached but pi cannot wire has to be said out loud: the
-    // turn still runs, the model just silently improvises around the missing tools.
-    const reason = unattachableJinnReason(resolvedMcp);
-    if (reason) logger.warn(`Pi engine is starting session ${sessionId} WITHOUT the jinn toolset: ${reason}`);
-    return { attached: false };
-  }
+  if (!piJinnMcpAttachable(resolvedMcp, sessionId)) return { attached: false };
 
   const extensionDir = path.join(JINN_HOME, "tmp", "pi-mcp", safeSessionId(sessionId));
   const extensionPath = path.join(extensionDir, "jinn-mcp-extension.ts");
   fs.mkdirSync(extensionDir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(extensionPath, piExtensionSource(), { mode: 0o600 });
+  fs.writeFileSync(
+    extensionPath,
+    piExtensionSource(JINN_MCP_SERVER_MODULE_URL, JINN_PI_MCP_MODULE_URL),
+    { mode: 0o600 },
+  );
   try {
     fs.chmodSync(extensionPath, 0o600);
   } catch {
@@ -89,10 +108,31 @@ export function cleanupPiJinnMcpExtension(handle: PiMcpExtensionHandle | undefin
   }
 }
 
-function piExtensionSource(): string {
+/**
+ * The remote counterpart of the two module URLs above.
+ *
+ * The extension runs INSIDE pi on the other machine, so both imports have to
+ * name that host's own jinn-cli install — the gateway's `dist` is not on it, and
+ * the mount deliberately carries the instance home rather than the package.
+ * `entryDir` is `<install>/dist/src/mcp` (probed by the facts script from the
+ * real path of that host's `jinn` bin), which is what makes both siblings
+ * derivable from it. The version is pinned equal to the gateway's at spawn, so
+ * these two modules are the same build the gateway is running.
+ *
+ * Pure, and POSIX by construction: the path being written is the remote host's.
+ */
+export function remotePiExtensionSource(entryDir: string): string {
+  const posixFileUrl = (p: string) => `file://${p}`;
+  return piExtensionSource(
+    posixFileUrl(path.posix.join(entryDir, "server.js")),
+    posixFileUrl(path.posix.join(entryDir, "..", "engines", "pi-mcp.js")),
+  );
+}
+
+function piExtensionSource(serverModuleUrl: string, piMcpModuleUrl: string): string {
   return `import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { buildTools, notesEnabledFromConfig } from ${JSON.stringify(JINN_MCP_SERVER_MODULE_URL)};
-import { projectPiTool } from ${JSON.stringify(JINN_PI_MCP_MODULE_URL)};
+import { buildTools, notesEnabledFromConfig } from ${JSON.stringify(serverModuleUrl)};
+import { projectPiTool } from ${JSON.stringify(piMcpModuleUrl)};
 
 export default function jinnMcpExtension(pi: ExtensionAPI): void {
   for (const tool of buildTools({

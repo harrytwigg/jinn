@@ -12,8 +12,10 @@ import { readGatewayInfo } from "../gateway/gateway-info.js";
 import { GATEWAY_INFO_FILE } from "../shared/paths.js";
 import { assertRemoteTarget, resolveRemoteClaudeConfigDir, sshDestination, REMOTE_STAGE_DIR_NAME } from "../shared/remote-target.js";
 import type { RemoteTarget, ResolvedMcpConfig } from "../shared/types.js";
+import type { RemoteEngineName } from "../shared/models.js";
 import type { RemoteExecutionConfig } from "../shared/config-types.js";
 import { remapMcpConfigForRemote } from "../mcp/remote-config.js";
+import { piJinnMcpAttachable, piJinnSessionEnv, remotePiExtensionSource } from "./pi-mcp.js";
 
 /**
  * Everything the gateway does to a remote host that is NOT the interactive
@@ -181,7 +183,12 @@ export interface RemoteFacts {
    *  `sessions/` tree; it is NOT itself a session's JINN_HOME. */
   stageDir: string;
   nodeBin: string;
-  claudeBin: string;
+  /** The agent CLIs found on the remote host, by engine name. Undefined for an
+   *  engine whose binary is not there — which is only an error for the engine a
+   *  given session actually runs (see {@link requireRemoteEngineBin}), because a
+   *  host that runs Pi employees has no reason to have Claude Code installed. */
+  claudeBin?: string;
+  piBin?: string;
   jinnVersion: string;
   /** Directory holding the remote install's `server-entry.js` / `scrub-entry.js`. */
   entryDir: string;
@@ -226,6 +233,7 @@ export PATH
 printf 'home=%s\\n' "$HOME"
 printf 'node=%s\\n' "$(command -v node 2>/dev/null || true)"
 printf 'claude=%s\\n' "$(command -v claude 2>/dev/null || true)"
+printf 'pi=%s\\n' "$(command -v pi 2>/dev/null || true)"
 jinnbin=$(command -v jinn 2>/dev/null || true)
 if [ -n "$jinnbin" ]; then
   printf 'jinnversion=%s\\n' "$(jinn --version 2>/dev/null | tr -d '\\r' | head -n 1)"
@@ -253,6 +261,24 @@ export function clearRemoteFactsCache(): void {
   factsCache.clear();
 }
 
+/**
+ * Whether `engine`'s CLI was seen on `destination`, from facts already gathered
+ * — `undefined` when this gateway has never probed that host.
+ *
+ * Tri-state on purpose. The one caller is the rate-limit substitution walker,
+ * which runs on the turn path and must not make an ssh round trip to answer a
+ * question about a host that just served a turn: it reads `false` as "do not
+ * hand the work to this engine" and `undefined` as "unknown — let the spawn
+ * say so", which is the same thing a collapsed boolean would get wrong in
+ * exactly the case that matters (a host whose facts are not cached yet would
+ * look like a host with nothing installed on it).
+ */
+export function remoteEngineAvailable(destination: string, engine: RemoteEngineName): boolean | undefined {
+  const facts = factsCache.get(destination);
+  if (!facts) return undefined;
+  return Boolean(engine === "claude" ? facts.claudeBin : facts.piBin);
+}
+
 /** Facts already learned about a host this gateway boot, without asking again.
  *  For callers on a hot path that must never make an ssh round trip — the hook
  *  endpoint, which fires many times a turn. Undefined before the first spawn,
@@ -262,12 +288,19 @@ export function cachedRemoteFacts(destination: string): RemoteFacts | undefined 
 }
 
 /**
- * Reject a host missing the binaries a session needs, naming the PATH cause.
+ * Reject a host missing the binaries EVERY session needs, naming the PATH cause.
  *
  * A non-interactive ssh reads no rc file, so the overwhelmingly common reason a
  * binary "is missing" here is that it is installed but only reachable from an
  * interactive shell. Being told to install something already installed sends
  * the operator down entirely the wrong path, so each message says how to check.
+ *
+ * The agent CLI is deliberately NOT checked here: facts are cached per host and
+ * shared by every session on it, and which agent a session needs is a property
+ * of its engine. A box that runs only Pi employees has no reason to carry Claude
+ * Code, and refusing it here would make a whole host unusable over a binary
+ * nothing on it was going to run. {@link requireRemoteEngineBin} makes that
+ * judgement per engine instead.
  */
 function assertRemoteToolchain(destination: string, kv: Record<string, string>): void {
   if (!kv.home) throw new Error(`${destination} reported no $HOME`);
@@ -279,13 +312,37 @@ function assertRemoteToolchain(destination: string, kv: Record<string, string>):
       + `(e.g. ~/.local/bin) or install Node.js system-wide`,
     );
   }
-  if (!kv.claude) {
-    throw new Error(
-      `${destination} has no \`claude\` on the non-interactive PATH. Check with `
-      + `\`ssh ${destination} 'command -v claude'\` — install Claude Code there and sign it in, `
-      + `or symlink it onto the default PATH if it is already installed`,
-    );
-  }
+}
+
+/** How an operator fixes a missing agent CLI, per engine. Both halves matter:
+ *  the check, because a version manager's binary is invisible to a
+ *  non-interactive ssh and "not installed" would be the wrong diagnosis; and the
+ *  install line, because the two CLIs are not installed the same way. */
+const REMOTE_ENGINE_INSTALL_HINT: Record<RemoteEngineName, string> = {
+  claude: "install Claude Code there and sign it in",
+  pi: "install the Pi CLI there and configure its providers in ~/.pi/agent/models.json",
+};
+
+/**
+ * The absolute path to the agent CLI this engine runs on the remote host.
+ *
+ * Throws rather than returning undefined: reaching a spawn with no binary is not
+ * a state any caller can do something useful with, and the message is the whole
+ * value — an unattended turn that fails with "no such file" tells the operator
+ * nothing about which machine, which binary, or which PATH.
+ */
+export function requireRemoteEngineBin(
+  destination: string,
+  facts: RemoteFacts,
+  engine: RemoteEngineName,
+): string {
+  const bin = engine === "claude" ? facts.claudeBin : facts.piBin;
+  if (bin) return bin;
+  throw new Error(
+    `${destination} has no \`${engine}\` on the non-interactive PATH. Check with `
+    + `\`ssh ${destination} 'command -v ${engine}'\` — ${REMOTE_ENGINE_INSTALL_HINT[engine]}, `
+    + `or symlink it onto the default PATH if it is already installed`,
+  );
 }
 
 async function gatherFacts(destination: string): Promise<RemoteFacts> {
@@ -321,7 +378,8 @@ async function gatherFacts(destination: string): Promise<RemoteFacts> {
     home: kv.home,
     stageDir: path.posix.join(kv.home, REMOTE_STAGE_DIR),
     nodeBin: kv.node,
-    claudeBin: kv.claude,
+    ...(kv.claude ? { claudeBin: kv.claude } : {}),
+    ...(kv.pi ? { piBin: kv.pi } : {}),
     jinnVersion: kv.jinnversion,
     entryDir: kv.entrydir,
   };
@@ -421,6 +479,11 @@ export type RemoteReadiness =
   | { ready: false; reason: string };
 
 export interface EnsureReadyOpts {
+  /** Which agent the session will run there. Decides which CLI must be present
+   *  and whether the Claude profile check applies — asked HERE, on the path that
+   *  has an operator to talk to, rather than at the spawn where the only
+   *  audience is a log line. */
+  engine: RemoteEngineName;
   /** Whether an unreachable host may be woken. FALSE for the dashboard's idle
    *  PTY: opening a terminal tab must never boot someone's desktop. */
   allowWake: boolean;
@@ -483,14 +546,31 @@ export async function ensureRemoteReady(
       if (problem) return { ready: false, reason: problem };
     }
     const facts = await gatherFacts(destination);
+    requireRemoteEngineBin(destination, facts, opts.engine);
     const mountProblem = await verifyMount(destination, remote);
     if (mountProblem) return { ready: false, reason: mountProblem };
-    const profileProblem = await verifyClaudeProfile(destination, resolveRemoteClaudeConfigDir(target, remote));
+    const profileProblem = await verifyEngineProfile(destination, target, remote, opts.engine);
     if (profileProblem) return { ready: false, reason: profileProblem };
     return { ready: true, facts };
   } catch (err) {
     return { ready: false, reason: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/** The profile half of readiness, which only one engine has.
+ *
+ *  Pi has no profile of its own to be signed out of: it drives a provider the
+ *  operator configured on that host, and those credentials are that provider's
+ *  business. Asking this question of a Pi session would refuse a perfectly good
+ *  host over a Claude Code install it never touches. */
+async function verifyEngineProfile(
+  destination: string,
+  target: RemoteTarget,
+  remote: RemoteExecutionConfig,
+  engine: RemoteEngineName,
+): Promise<string | undefined> {
+  if (engine !== "claude") return undefined;
+  return await verifyClaudeProfile(destination, resolveRemoteClaudeConfigDir(target, remote));
 }
 
 /** Hosts+profiles already seen signed in. Only SUCCESS is cached: a profile that
@@ -685,18 +765,30 @@ export function remoteRelayScript(facts: RemoteFacts): string {
   return path.posix.join(facts.stageDir, "hook-relay.mjs");
 }
 
-/** A remote session's own `$JINN_HOME`.
+/** A remote session's own `$JINN_HOME`, per session AND per engine.
  *
- *  Per SESSION, not per host, and that is load-bearing. `gateway.json` names
- *  the reverse-tunnel port, which is allocated per spawn — so a single shared
- *  copy means any second prepare rewrites the port another LIVE session's hook
- *  relay is about to read. The relay would then POST into a port with no tunnel
- *  behind it and, by design, swallow the failure: no Stop, no policy
- *  enforcement, and a turn that runs to completion while the gateway hears
- *  nothing. Giving each session its own home makes that collision impossible
- *  rather than unlikely. */
-export function remoteSessionHome(facts: RemoteFacts, jinnSessionId: string): string {
-  return path.posix.join(facts.stageDir, SESSIONS_DIR, safeSessionSegment(jinnSessionId));
+ *  Per SESSION because `gateway.json` names the reverse-tunnel port, which is
+ *  allocated per spawn — so a single shared copy means any second prepare
+ *  rewrites the port another LIVE session's hook relay is about to read. The
+ *  relay would then POST into a port with no tunnel behind it and, by design,
+ *  swallow the failure: no Stop, no policy enforcement, and a turn that runs to
+ *  completion while the gateway hears nothing.
+ *
+ *  Per ENGINE for exactly the same reason, once a session can change engine
+ *  mid-flight. A rate-limited Claude session is substituted onto pi WITHOUT its
+ *  PTY being released: that PTY stays warm, takes the next turn through
+ *  `injectPrompt` with no re-staging, and its relay re-reads `gateway.json` on
+ *  every hook. Sharing one home would have pi's prepare repoint the live Claude
+ *  session's relay at a tunnel that dies when pi's ssh exits. Locally the two
+ *  engines keep entirely separate state (Claude's own config dir, pi's
+ *  `--session-dir`); this is that same separation on the other machine.
+ *
+ *  Flat rather than nested under the session, because the stage reaper matches
+ *  `-mindepth 1 -maxdepth 1 -type d -mtime` (FARM_SCRIPT): a parent directory's
+ *  mtime does not move when a spawn writes inside it, so a nested layout would
+ *  put live sessions in front of the reaper. */
+export function remoteSessionHome(facts: RemoteFacts, jinnSessionId: string, engine: RemoteEngineName): string {
+  return path.posix.join(facts.stageDir, SESSIONS_DIR, safeSessionSegment(`${jinnSessionId}__${engine}`));
 }
 
 /**
@@ -709,16 +801,22 @@ export function remoteSessionHome(facts: RemoteFacts, jinnSessionId: string): st
  * (the farm is deliberately NOT called `.jinn`), and concludes the memory layer
  * does not exist for them: three review rounds on DAH-213 recorded nothing
  * (DAH-214 item 3).
+ *
+ * Taken from the home the caller was actually GIVEN by `prepareRemoteSession`,
+ * not recomputed from the session id: the home is keyed on the engine as well
+ * as the session, and a second derivation is a second chance to name a farm
+ * that this spawn never staged — a PATH entry pointing at nothing, and `mem`
+ * missing again with no error anywhere.
  */
-export function remoteSessionBinDir(facts: RemoteFacts, jinnSessionId: string): string {
-  return path.posix.join(remoteSessionHome(facts, jinnSessionId), "bin");
+export function remoteSessionBinDir(sessionHome: string): string {
+  return path.posix.join(sessionHome, "bin");
 }
 
 /** Session ids are gateway-generated and already path-safe; this is here so a
  *  hand-crafted one can never walk out of the sessions directory. */
-function safeSessionSegment(jinnSessionId: string): string {
-  const clean = String(jinnSessionId).replace(/[^A-Za-z0-9._-]/g, "_");
-  if (!clean || clean === "." || clean === "..") throw new Error(`unusable session id for remote staging: "${jinnSessionId}"`);
+function safeSessionSegment(segment: string): string {
+  const clean = String(segment).replace(/[^A-Za-z0-9._-]/g, "_");
+  if (!clean || clean === "." || clean === "..") throw new Error(`unusable session id for remote staging: "${segment}"`);
   return clean;
 }
 
@@ -924,6 +1022,12 @@ export interface PrepareRemoteSessionOpts {
   target: RemoteTarget;
   remote: RemoteExecutionConfig;
   facts: RemoteFacts;
+  /** Which agent runs there. The two need different things staged, and staging
+   *  the other one's is not free: Claude's settings.json registers seven hooks
+   *  against a relay Pi never invokes, and the folder-trust seed rewrites the
+   *  remote user's `.claude.json` — a real side effect on a host that may have
+   *  no Claude Code on it at all. */
+  engine: RemoteEngineName;
   jinnSessionId: string;
   /** Gateway port the reverse tunnel forwards to. */
   gatewayPort: number;
@@ -931,57 +1035,91 @@ export interface PrepareRemoteSessionOpts {
   resolvedMcp?: ResolvedMcpConfig;
 }
 
-export interface RemoteSessionStaging {
+interface RemoteSessionStagingBase {
   destination: string;
   tunnelPort: number;
   /** This session's own `$JINN_HOME` on the remote host. */
   sessionHome: string;
-  /** Remote path for `--settings`. */
-  settingsPath: string;
-  /** Remote path for `--mcp-config`, when this session has MCP servers. */
-  mcpConfigPath?: string;
   /** 0600 shell fragment the remote command sources for the session's secrets.
    *  A file rather than argv: everything on a remote command line is world-
    *  readable in that host's process table. */
   envFilePath: string;
 }
 
+export interface RemoteClaudeStaging extends RemoteSessionStagingBase {
+  engine: "claude";
+  /** Remote path for `--settings`. */
+  settingsPath: string;
+  /** Remote path for `--mcp-config`, when this session has MCP servers. */
+  mcpConfigPath?: string;
+}
+
+export interface RemotePiStaging extends RemoteSessionStagingBase {
+  engine: "pi";
+  /** Remote path for `--session-dir`. A REAL directory under the session stage,
+   *  never a symlink through the mount: Pi writes its conversation state here on
+   *  every turn, and `--resume` across turns depends on it still being there —
+   *  which is exactly what a network filesystem cannot promise. */
+  piSessionDir: string;
+  /** Remote path for `--extension`, when the jinn toolset could be wired.
+   *  Undefined when this session carries no built-in `jinn` server, which is the
+   *  same condition the local path treats as "run without the belt". */
+  piExtensionPath?: string;
+}
+
+export type RemoteSessionStaging = RemoteClaudeStaging | RemotePiStaging;
+
 /**
  * Stage everything one remote session needs and return the remote paths its
  * argv must reference.
  *
  * Ordering matters: the farm is rebuilt before anything is written into the
- * stage directory, and the trust seed runs before the session is ever spawned.
+ * stage directory, and Claude's trust seed runs before the session is ever
+ * spawned.
  */
+export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts & { engine: "claude" }): Promise<RemoteClaudeStaging>;
+export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts & { engine: "pi" }): Promise<RemotePiStaging>;
 export async function prepareRemoteSession(opts: PrepareRemoteSessionOpts): Promise<RemoteSessionStaging> {
-  const { target, remote, facts, jinnSessionId } = opts;
+  const { target, remote, facts, jinnSessionId, engine } = opts;
   assertRemoteTarget(target, remote);
   const destination = sshDestination(target);
-  const sessionHome = remoteSessionHome(facts, jinnSessionId);
+  const sessionHome = remoteSessionHome(facts, jinnSessionId, engine);
 
   // Only the two steps that touch per-HOST state are serialized; everything
   // below writes inside this session's own directory and cannot collide.
   await serializePerHost(destination, async () => {
     const present = await rebuildHomeFarm(destination, facts, remote.mount, sessionHome, target.remoteCwd);
     await ensureAssets(destination, facts, present);
-    await seedRemoteTrust(destination, facts, target.remoteCwd, resolveRemoteClaudeConfigDir(target, remote));
+    // Claude Code's folder-trust dialog is the thing being pre-empted here, and
+    // it is Claude Code's alone: `pi -p` reads its prompt from stdin and prints
+    // JSON, with no first-run dialog to hang on and no `.claude.json` to write.
+    if (engine === "claude") {
+      await seedRemoteTrust(destination, facts, target.remoteCwd, resolveRemoteClaudeConfigDir(target, remote));
+    }
   });
 
   const tunnelPort = await probeFreePort(destination, facts);
 
   await stageGatewayJson(destination, sessionHome, tunnelPort);
-  const settingsPath = await stageSettings(destination, facts, sessionHome, jinnSessionId);
-  const envFilePath = await stageSessionEnvFile(destination, sessionHome, tunnelPort);
-  const mcpConfigPath = await stageMcpConfig(destination, facts, sessionHome, tunnelPort, opts.resolvedMcp);
-
-  return {
+  // The session identity pi's extension reads. Staged into the 0600 file rather
+  // than the remote command line for the same reason the bearer is.
+  const envFilePath = await stageSessionEnvFile(
     destination,
-    tunnelPort,
     sessionHome,
-    settingsPath,
-    envFilePath,
-    ...(mcpConfigPath ? { mcpConfigPath } : {}),
-  };
+    tunnelPort,
+    engine === "pi" ? piJinnSessionEnv(opts.resolvedMcp) : {},
+  );
+  const base = { destination, tunnelPort, sessionHome, envFilePath };
+
+  if (engine === "pi") {
+    const piSessionDir = await stagePiSessionDir(destination, sessionHome);
+    const piExtensionPath = await stagePiExtension(destination, facts, sessionHome, jinnSessionId, opts.resolvedMcp);
+    return { ...base, engine, piSessionDir, ...(piExtensionPath ? { piExtensionPath } : {}) };
+  }
+
+  const settingsPath = await stageSettings(destination, facts, sessionHome, jinnSessionId);
+  const mcpConfigPath = await stageMcpConfig(destination, facts, sessionHome, tunnelPort, opts.resolvedMcp);
+  return { ...base, engine, settingsPath, ...(mcpConfigPath ? { mcpConfigPath } : {}) };
 }
 
 /**
@@ -1021,13 +1159,36 @@ async function stageGatewayJson(destination: string, sessionHome: string, tunnel
  * to every process on that host, and the bearer token is not something to put
  * in a process table.
  */
-async function stageSessionEnvFile(destination: string, sessionHome: string, tunnelPort: number): Promise<string> {
+async function stageSessionEnvFile(
+  destination: string,
+  sessionHome: string,
+  tunnelPort: number,
+  /** Further exports for this session's identity. Pi's belt travels here rather
+   *  than in the remote command, because `JINN_SESSION_CAPABILITY` authorizes
+   *  acting AS this session against the gateway and every remote command line is
+   *  readable in that host's process table. Claude's equivalent rides inside the
+   *  0600 staged mcp.json; this file is the same protection for an engine that
+   *  has no such file. */
+  extraExports: Record<string, string> = {},
+): Promise<string> {
   const info = readGatewayInfo(GATEWAY_INFO_FILE);
-  const lines = [`export JINN_GATEWAY_URL=${shq(`http://127.0.0.1:${tunnelPort}`)}`];
-  if (info?.token) lines.push(`export JINN_GATEWAY_TOKEN=${shq(info.token)}`);
   const envFilePath = path.posix.join(sessionHome, "tmp", "session-env.sh");
-  await stageRemoteFile(destination, envFilePath, `${lines.join("\n")}\n`);
+  await stageRemoteFile(destination, envFilePath, buildSessionEnvFile(tunnelPort, info?.token, extraExports));
   return envFilePath;
+}
+
+/** The sourceable fragment itself. Pure, and exported, so which values land in a
+ *  0600 file rather than on a world-readable command line is a testable claim
+ *  rather than an assertion about a function that needs two machines to run. */
+export function buildSessionEnvFile(
+  tunnelPort: number,
+  token: string | undefined,
+  extraExports: Record<string, string> = {},
+): string {
+  const lines = [`export JINN_GATEWAY_URL=${shq(`http://127.0.0.1:${tunnelPort}`)}`];
+  if (token) lines.push(`export JINN_GATEWAY_TOKEN=${shq(token)}`);
+  for (const [key, value] of Object.entries(extraExports)) lines.push(`export ${key}=${shq(value)}`);
+  return `${lines.join("\n")}\n`;
 }
 
 /** Reuse the real settings builder rather than reimplementing the hook set — it
@@ -1074,6 +1235,53 @@ async function stageMcpConfig(
   return mcpConfigPath;
 }
 
+/**
+ * Create this session's Pi state directory on the remote host.
+ *
+ * Pi keys a conversation on `--session-id` inside `--session-dir`, so this
+ * directory IS the session's `--resume`: lose it between turns and pi silently
+ * starts a new conversation with no memory of the last one. It therefore lives
+ * in the real, per-session part of the stage — beside `tmp/`, never in the
+ * symlink farm, where it would be written across sshfs into the gateway's own
+ * home and disappear from pi's view the moment the mount blipped.
+ *
+ * Created here rather than left to pi: the local engine already pre-creates it
+ * (`pi.ts` mkdirSync) because a missing session dir is not something pi's own
+ * error output explains well.
+ */
+async function stagePiSessionDir(destination: string, sessionHome: string): Promise<string> {
+  const dir = path.posix.join(sessionHome, "pi-session");
+  const res = await sshRun(destination, [`mkdir -p ${shq(dir)} && chmod 700 ${shq(dir)}`]);
+  if (res.code !== 0) {
+    throw new Error(`could not create the remote pi session dir ${dir} on ${destination}: ${res.stderr.trim() || `exit ${res.code}`}`);
+  }
+  return dir;
+}
+
+/**
+ * Stage pi's generated `jinn` extension, re-pointed at the REMOTE install.
+ *
+ * Pi does not read an `--mcp-config`; it loads the company toolset from a
+ * generated module that runs the built-in stdio server in-process
+ * (`pi-mcp.ts`). That module's two imports are absolute paths to the GATEWAY's
+ * `dist` — nothing on the other host — so the remote copy is regenerated
+ * against `facts.entryDir` instead. Everything else the tools need travels the
+ * way it does for Claude: the bearer and the gateway URL through the 0600 env
+ * file, over the same reverse tunnel.
+ */
+async function stagePiExtension(
+  destination: string,
+  facts: RemoteFacts,
+  sessionHome: string,
+  jinnSessionId: string,
+  resolvedMcp: ResolvedMcpConfig | undefined,
+): Promise<string | undefined> {
+  if (!piJinnMcpAttachable(resolvedMcp, jinnSessionId)) return undefined;
+  const extensionPath = path.posix.join(sessionHome, "tmp", "pi-mcp", "jinn-mcp-extension.ts");
+  await stageRemoteFile(destination, extensionPath, remotePiExtensionSource(facts.entryDir));
+  return extensionPath;
+}
+
 // ── The interactive spawn ────────────────────────────────────────────────────
 
 export interface SshSpawnOpts {
@@ -1105,8 +1313,22 @@ export interface SshSpawnOpts {
    *  Sourced rather than inlined because a remote command line is readable by
    *  every process on that host. */
   envFile?: string;
-  claudeBin: string;
-  claudeArgs: string[];
+  /** The agent CLI ON THE REMOTE host, and its argv. Not "claude": the same
+   *  transport carries `pi` for a Pi employee, and the only difference between
+   *  the two commands is this pair plus {@link allocateTty}. */
+  bin: string;
+  args: string[];
+  /**
+   * Whether ssh allocates a remote pseudo-terminal (`-tt`), the default.
+   *
+   * True for Claude Code, whose TUI needs one. FALSE for pi, and not as a
+   * preference: a tty is a single byte stream, so the remote process's stderr
+   * is folded into stdout and its diagnostics land in the middle of the
+   * newline-delimited JSON the engine parses — the run's real error then reads
+   * as an unparseable line and is dropped. Without a tty the two streams stay
+   * separate, stdin is a clean pipe for the prompt, and the JSON arrives intact.
+   */
+  allocateTty?: boolean;
 }
 
 /**
@@ -1115,7 +1337,8 @@ export interface SshSpawnOpts {
  * The flags are all load-bearing:
  *  - `-tt` forces remote PTY allocation. Passing an explicit remote command
  *    makes ssh default to NO pty, which breaks the TUI outright and with it the
- *    viewport parser that answers Claude Code's safety prompts.
+ *    viewport parser that answers Claude Code's safety prompts. A batch engine
+ *    passes `allocateTty: false` and gets `-T` instead — see that field.
  *  - `BatchMode=yes` keeps this key-only; there is nobody at the keyboard.
  *  - `EscapeChar=none` disables ssh's own `~`-prefixed escapes, which are
  *    otherwise live on the local PTY and could fire on transcript or paste
@@ -1139,15 +1362,15 @@ export function buildSshSpawnArgs(opts: SshSpawnOpts): string[] {
   const env = Object.entries(opts.remoteEnv)
     .map(([key, value]) => `${key}=${shq(value)}`)
     .join(" ");
-  const claude = [opts.claudeBin, ...opts.claudeArgs].map(shq).join(" ");
+  const agent = [opts.bin, ...opts.args].map(shq).join(" ");
   // Sourced BEFORE `env`, so the exported values are inherited through it while
   // `env -u` still strips the billing-critical names from the login profile.
   const source = opts.envFile ? `. ${shq(opts.envFile)} && ` : "";
   // `exec` so the remote shell is replaced by claude: one fewer process between
   // sshd and the TUI, so a dropped connection reaches claude directly.
-  const remoteCommand = `cd ${shq(opts.remoteCwd)} && ${source}exec env ${unset ? `${unset} ` : ""}${pathEntry}${env} ${claude}`;
+  const remoteCommand = `cd ${shq(opts.remoteCwd)} && ${source}exec env ${unset ? `${unset} ` : ""}${pathEntry}${env} ${agent}`;
   return [
-    "-tt",
+    opts.allocateTty === false ? "-T" : "-tt",
     "-o", "BatchMode=yes",
     "-o", "EscapeChar=none",
     "-o", "ExitOnForwardFailure=yes",

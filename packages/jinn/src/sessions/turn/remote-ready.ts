@@ -1,5 +1,6 @@
 import { logger } from "../../shared/logger.js";
 import { employeeRemoteTarget } from "../../shared/remote-target.js";
+import { engineSupportsRemote, REMOTE_ENGINE_NAMES, type RemoteEngineName } from "../../shared/models.js";
 import { ensureRemoteReady } from "../../engines/remote-stage.js";
 import { getSession, updateSessionForAttempt } from "../registry.js";
 import { notifyOperatorChannel } from "../callbacks.js";
@@ -24,22 +25,23 @@ import type { TurnInput } from "./types.js";
  * back every local employee's turn too.
  */
 /**
- * Only the interactive claude engine knows how to relocate a session over SSH.
- * Every other engine ignores `remoteHost` entirely and would run the turn on
- * the GATEWAY — with `--dangerously-skip-permissions`, against a checkout that
- * is not there — while the UI showed a remote employee working normally.
+ * Only an engine on {@link REMOTE_ENGINE_NAMES} knows how to relocate a session
+ * over SSH. Every other engine ignores `remoteHost` entirely and would run the
+ * turn on the GATEWAY — with `--dangerously-skip-permissions`, against a
+ * checkout that is not there — while the UI showed a remote employee working
+ * normally.
  */
 function refuseNonRemoteEngine(
   input: TurnInput,
   remoteHost: string,
   engineName: string,
 ): { ok: false; error: string } | undefined {
-  if (engineName === "claude") return undefined;
+  if (engineSupportsRemote(engineName)) return undefined;
   return {
     ok: false,
     error: `Employee "${input.employee?.name ?? "?"}" is configured for remote execution on ${remoteHost}, `
       + `but the "${engineName}" engine has no remote support — the turn would run on the gateway instead. `
-      + `Use the claude engine for remote employees.`,
+      + `Remote employees run on ${REMOTE_ENGINE_NAMES.join(" or ")}.`,
   };
 }
 
@@ -81,6 +83,10 @@ export async function ensureRemoteHostReady(
   let announced: string | undefined;
 
   const readiness = await ensureRemoteReady(target, input.config.remote, {
+    // Narrowed by refuseNonRemoteEngine above: anything else has already
+    // returned. Which engine it is decides which agent CLI must be present on
+    // that host — a Pi box need not carry Claude Code, and vice versa.
+    engine: engineName as RemoteEngineName,
     allowWake: true,
     onWaitStart: ({ destination, waking }) => {
       announced = destination;
