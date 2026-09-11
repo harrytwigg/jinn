@@ -1,7 +1,7 @@
 import { loadConfig } from "../shared/config.js";
 import { scanOrg } from "../gateway/org.js";
 import { employeeRemoteTarget, resolveRemoteClaudeConfigDir, sshDestination, validateRemoteTarget } from "../shared/remote-target.js";
-import { ensureRemoteReady, sendWakeOnLan, clearRemoteFactsCache } from "../engines/remote-stage.js";
+import { ensureRemoteReady, sendWakeOnLan, clearRemoteFactsCache, remoteEngineBin } from "../engines/remote-stage.js";
 import type { RemoteTarget } from "../shared/types.js";
 import { engineSupportsRemote, REMOTE_ENGINE_NAMES } from "../shared/models.js";
 
@@ -131,7 +131,8 @@ async function printEmployeeStatus(
     const profile = resolveRemoteClaudeConfigDir(employee.target, remote);
     console.log(`  ${DIM}profile ${profile ?? "(default)"}, claude ${readiness.facts.claudeBin}${RESET}`);
   } else {
-    console.log(`  ${DIM}engine ${employee.engine}, pi ${readiness.facts.piBin}${RESET}`);
+    const bin = remoteEngineBin(readiness.facts, employee.engine) ?? "(not found)";
+    console.log(`  ${DIM}engine ${employee.engine}, bin ${bin}${RESET}`);
   }
 }
 

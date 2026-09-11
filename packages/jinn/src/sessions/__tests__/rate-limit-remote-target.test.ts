@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { EngineName } from "../../shared/models.js";
 
 /**
  * A rate limit is the one moment a turn is respawned rather than resumed, which
@@ -20,17 +21,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // ── Mocks (must be declared before importing the module under test) ──────────
 
 const engineAvailableMock = vi.fn<(...args: unknown[]) => boolean>();
-vi.mock("../../shared/models.js", () => ({
+vi.mock("../../shared/models.js", async (importOriginal) => ({
+  // Only the three that would reach a real CLI or a real registry are replaced.
+  // ENGINE_NAMES, REMOTE_ENGINE_NAMES, isKnownEngine and engineSupportsRemote
+  // stay REAL: which engines can relocate a turn is the fact under test in the
+  // substitution cases below, and a hand-written copy of that list here would
+  // keep passing after the real one changed.
+  ...(await importOriginal<typeof import("../../shared/models.js")>()),
   engineAvailable: (...args: unknown[]) => engineAvailableMock(...args),
   effortLevelsForModel: vi.fn(() => ["low", "medium", "high"]),
   getModelRegistry: vi.fn(() => ({})),
-  // The chain walker's module reads both of these at load time.
-  ENGINE_NAMES: ["claude", "codex", "antigravity", "grok", "pi", "hermes"],
-  isKnownEngine: (name: string) => ["claude", "codex", "antigravity", "grok", "pi", "hermes"].includes(name),
-  // NOT mocked away to a stub: which engines can relocate a turn is the fact
-  // under test in the substitution cases below, so the real membership answers.
-  REMOTE_ENGINE_NAMES: ["claude", "pi"],
-  engineSupportsRemote: (name: string) => ["claude", "pi"].includes(name),
 }));
 
 /** What the gateway learned about the REMOTE host's PATH at the last spawn.
@@ -103,7 +103,7 @@ function makeOpts(args: {
   /** The engine claude's chain names. Defaults to codex — which cannot follow a
    *  session onto another machine, and is the reason most of these cases fall
    *  through to Branch B. */
-  chain?: "codex" | "pi";
+  chain?: EngineName;
 }): RateLimitHandlerOpts {
   const substitute = args.chain ?? "codex";
   return {
@@ -292,6 +292,25 @@ describe("handleRateLimit — a remote employee only substitutes onto an engine 
     // the turn it takes over runs on the gateway — the failure the blanket
     // suppression existed to avoid, arriving through the engine that fixed it.
     expect(substituteRun).toHaveBeenCalledWith(expect.objectContaining(REMOTE));
+  });
+
+  it("substitutes onto opencode, the third engine that can follow a session", async () => {
+    // Same guarantee as the pi case, asserted separately because the two are
+    // wired through different fields of RemoteFacts: an engine added to
+    // REMOTE_ENGINE_NAMES but not to the facts probe would be offered the turn
+    // and then fail to find its own binary.
+    const substituteRun = answered("from-opencode");
+
+    const outcome = await handleRateLimit(makeOpts({
+      substituteRun,
+      retryRun: vi.fn(),
+      employee: employee(REMOTE),
+      chain: "opencode",
+    }));
+
+    expect(outcome).toMatchObject({ kind: "fallback", result: { result: "from-opencode" } });
+    expect(substituteRun).toHaveBeenCalledWith(expect.objectContaining(REMOTE));
+    expect(remoteEngineAvailableMock).toHaveBeenCalledWith("jinn@build-box", "opencode");
   });
 
   it("asks the REMOTE host's PATH, not the gateway's, whether pi is installed", async () => {

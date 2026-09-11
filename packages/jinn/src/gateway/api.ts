@@ -19,6 +19,7 @@ import {
   refreshGrokModels,
   refreshHermesModels,
   refreshPiModels,
+  refreshOpencodeModels,
 } from "../shared/models.js";
 import { withEngineHealth } from "../shared/engine-health.js";
 import { validateNewSessionSelection, validateSessionPatch } from "../sessions/session-patch.js";
@@ -4526,6 +4527,7 @@ export async function handleApiRequest(
         refreshCodexModels(config),
         refreshAntigravityModels(config),
         refreshPiModels(config),
+        refreshOpencodeModels(config),
         refreshGrokModels(config),
         refreshHermesModels(config),
       ]);
