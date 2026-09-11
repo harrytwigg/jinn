@@ -231,8 +231,9 @@ session, all of them consequences of Pi being a batch engine rather than a TUI:
   in-process, and that module's imports are absolute paths. The remote copy is
   regenerated against the remote install's own `jinn-cli` — which is why the
   version match is enforced there too — and reaches the gateway over the same
-  reverse tunnel, with the bearer staged in a 0600 file rather than put on a
-  command line.
+  reverse tunnel. The bearer *and* this session's capability are staged into a
+  0600 file the remote command sources, never put on the command line, which is
+  readable by every process on that host.
 
 One asymmetry worth stating plainly. A remote Claude session has
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` stripped
@@ -273,11 +274,23 @@ and carries on. Without it — or with a chain naming an engine that cannot go
 remote — the turn waits the limit out on the host that already owns the work,
 which is what it did before.
 
-Two things this gets right that are easy to get wrong:
+Four things this gets right that are easy to get wrong:
 
 - **The substitute is told where to run.** A rate limit is the one moment a turn
-  is respawned rather than resumed, so the remote target is restated; otherwise
-  the fallback turn would quietly come back on the gateway.
+  is respawned rather than resumed, so the remote target — host, user, working
+  directory *and* Claude profile — is restated; otherwise the fallback turn would
+  quietly come back on the gateway, or come back under the wrong profile.
+- **Each engine stages its own `$JINN_HOME` on the remote host**, under
+  `~/.jinn-remote-stage/sessions/<session>__<engine>`. The substituted-from
+  engine's session is not torn down — a remote Claude PTY stays warm and takes
+  its next turn through the same connection — and its hook relay re-reads
+  `gateway.json` on every hook. A shared directory would have the substitute's
+  staging repoint that relay at a tunnel which dies with the substitute.
+- **A substitute that cannot start is reported, not swallowed.** The session's
+  engine has already been flipped by the time it runs, which is enough to make a
+  thrown spawn look stale to the turn runner and be dropped — leaving the session
+  at `running` with nothing said. It is caught where the flip happened and
+  settled as a failed fallback carrying the real reason.
 - **Availability is asked of the remote host, not the gateway.** A Raspberry Pi
   orchestrator has no `pi` CLI on it and does not need one. The check reads what
   the last spawn learned about the remote host's PATH; a host that has never been
