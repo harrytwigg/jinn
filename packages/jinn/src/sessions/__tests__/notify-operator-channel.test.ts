@@ -45,32 +45,46 @@ describe("notifyOperatorChannel", () => {
       method: "POST",
       body: JSON.stringify({ channel: "700000001", text: "🔐 something broke" }),
     }));
-    expect(onSent).toHaveBeenCalledTimes(1);
+    expect(onSent).toHaveBeenCalledExactlyOnceWith(true);
   });
 
-  it("warns, names the fix, and does not confirm when no channel resolves", async () => {
+  // GEN-53 review: a caller holding a one-shot marker — "this outage has been
+  // announced", "this expiry has had its warning" — needs the false as much as
+  // the true, or the marker is burnt on an alert nobody received.
+  it("warns, names the fix, and reports the drop when no channel resolves", async () => {
     const fetchSpy = vi.fn();
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
-    const onSent = vi.fn();
+    const onResult = vi.fn();
 
-    notifyOperatorChannel("🔐 something broke\nsecond line", onSent);
+    notifyOperatorChannel("🔐 something broke\nsecond line", onResult);
     await flush();
 
     expect(fetchSpy).not.toHaveBeenCalled();
-    expect(onSent).not.toHaveBeenCalled();
+    expect(onResult).toHaveBeenCalledExactlyOnceWith(false);
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("set notifications.connector/channel"));
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("alert dropped: 🔐 something broke"));
   });
 
-  it("does not confirm a send the connector refused", async () => {
+  it("reports a send the connector refused as not delivered", async () => {
     hoisted.config = { notifications: { connector: "telegram", channel: "1" } };
     globalThis.fetch = vi.fn(async () => ({ ok: false, status: 502 })) as unknown as typeof fetch;
-    const onSent = vi.fn();
+    const onResult = vi.fn();
 
-    notifyOperatorChannel("x", onSent);
+    notifyOperatorChannel("x", onResult);
     await flush();
 
-    expect(onSent).not.toHaveBeenCalled();
+    expect(onResult).toHaveBeenCalledExactlyOnceWith(false);
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("connector notification failed (502)"));
+  });
+
+  it("reports a transport failure as not delivered", async () => {
+    hoisted.config = { notifications: { connector: "telegram", channel: "1" } };
+    globalThis.fetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch;
+    const onResult = vi.fn();
+
+    notifyOperatorChannel("x", onResult);
+    await flush();
+
+    expect(onResult).toHaveBeenCalledExactlyOnceWith(false);
   });
 });

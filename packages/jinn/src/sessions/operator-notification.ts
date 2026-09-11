@@ -9,13 +9,19 @@ import { resolveOperatorNotificationTarget, type OperatorNotificationTarget } fr
  * resolveOperatorNotificationTarget). Used for alerts that must reach a human
  * without depending on an LLM — rate limits, auth outages, and a workflow
  * parked on a decision with no employee session to wake. Fire-and-forget:
- * errors are logged but never rethrown; `onSent` runs only on delivery.
+ * errors are logged but never rethrown.
+ *
+ * `onResult` always runs, with whether the message actually reached the
+ * channel. Callers that debounce on "the operator has been told" need the
+ * false as much as the true — a one-shot marker burnt on an alert nobody
+ * received is worse than no marker at all.
  */
-export function notifyOperatorChannel(message: string, onSent?: () => void): void {
+export function notifyOperatorChannel(message: string, onResult?: (sent: boolean) => void): void {
   _sendOperatorNotification(message)
-    .then((sent) => { if (sent) onSent?.(); })
+    .then((sent) => onResult?.(sent))
     .catch((err) => {
       logger.warn(`[operator-notification] Failed to send operator notification: ${err instanceof Error ? err.message : String(err)}`);
+      onResult?.(false);
     });
 }
 

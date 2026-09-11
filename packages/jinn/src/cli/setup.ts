@@ -313,10 +313,10 @@ portal:
 #     enabled: true
 #     tokenThreshold: 300000
 #     staleAfterMinutes: 60
-# Alerts. Failed cron jobs go to cron.alert*; LLM-free operator alerts (usage limits, a
-# Claude login the gateway cannot refresh) go to notifications.*, else cron.alert*, else a
-# cron: { alertConnector: slack, alertChannel: "#alerts" }        # single-user Telegram allowlist.
-# notifications: { connector: telegram, channel: "123456789" }    # chat id / channel id / #channel
+# Alerts. Failed cron jobs go to cron.alert*. LLM-free operator alerts (usage limits, a dead
+# Claude login) go to notifications.*, else cron.alert*, else a single-user Telegram allowlist.
+# cron: { alertConnector: slack, alertChannel: "#alerts" }
+# notifications: { connector: telegram, channel: "123456789" }   # chat id / channel id / #channel
 
 logging:
   file: true

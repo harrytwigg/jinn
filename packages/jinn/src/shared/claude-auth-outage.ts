@@ -1,6 +1,4 @@
-import fs from "node:fs";
-import path from "node:path";
-import { JINN_HOME } from "./paths.js";
+import { readStore, writeStore, type ClaudeAuthOutage } from "./claude-auth-ledger.js";
 import type { ClaudeCredentialStatus } from "./claude-auth.js";
 
 /**
@@ -8,36 +6,13 @@ import type { ClaudeCredentialStatus } from "./claude-auth.js";
  * it: "is this the first failure, or the forty-second?" and "should a launch
  * even be attempted?"
  *
- * Pure state over one small JSON file; no notifications and no network live
- * here. The side effects — the operator message, the engine-health record —
- * belong to sessions/claude-auth-watch.ts, so this can be tested as a state
- * machine and the message wording as text.
- *
- * Why a file: an outage outlives gateway restarts (the one that prompted this
- * ran six hours across a `jinn restart`), and re-alerting after every restart
- * is the spam the debounce exists to prevent.
+ * Policy over the record in claude-auth-ledger.ts; no notifications and no
+ * network live here. The side effects — the operator message, the engine-health
+ * record — belong to sessions/claude-auth-watch.ts, and the wording to
+ * claude-auth-messages.ts, so each can be read and tested on its own.
  */
 
-export interface ClaudeAuthOutage {
-  /** ISO. First failure of this outage. */
-  since: string;
-  /** Turns that reached Claude Code and came back `authentication_failed`. */
-  failures: number;
-  /** Launches preflight refused because the credentials already proved dead. */
-  skipped: number;
-  lastFailureAt: string;
-  lastReason: string;
-  /** The on-disk pair that failed. A launch on a DIFFERENT pair is worth trying. */
-  credentialFingerprint?: string;
-  /** ISO. When the operator was told. Absent means the alert could not be sent. */
-  alertedAt?: string;
-}
-
-interface OutageStore {
-  outages: Record<string, ClaudeAuthOutage>;
-  /** The `refreshTokenExpiresAt` the operator was last warned about. */
-  refreshExpiryWarnedFor?: number;
-}
+export type { ClaudeAuthOutage } from "./claude-auth-ledger.js";
 
 /** Credentials on the gateway host itself. Remote hosts get their own scope. */
 export const LOCAL_CLAUDE_AUTH_SCOPE = "local";
@@ -55,40 +30,6 @@ export const CLAUDE_AUTH_RECHECK_MS = 60 * 60_000;
  *  weeks; two days is enough notice to log in before it bites. */
 export const CLAUDE_REFRESH_EXPIRY_WARNING_MS = 48 * 60 * 60_000;
 
-const STATE_PATH = path.join(JINN_HOME, "tmp", "claude-auth-outage.json");
-
-function parseOutages(raw: unknown): Record<string, ClaudeAuthOutage> {
-  const outages: Record<string, ClaudeAuthOutage> = {};
-  if (!raw || typeof raw !== "object") return outages;
-  for (const [scope, record] of Object.entries(raw as Record<string, ClaudeAuthOutage | null>)) {
-    if (record && typeof record === "object" && typeof record.since === "string") outages[scope] = record;
-  }
-  return outages;
-}
-
-function readStore(): OutageStore {
-  try {
-    if (!fs.existsSync(STATE_PATH)) return { outages: {} };
-    const parsed = JSON.parse(fs.readFileSync(STATE_PATH, "utf-8")) as Partial<OutageStore> | null;
-    if (!parsed || typeof parsed !== "object") return { outages: {} };
-    const warned = parsed.refreshExpiryWarnedFor;
-    return { outages: parseOutages(parsed.outages), ...(typeof warned === "number" ? { refreshExpiryWarnedFor: warned } : {}) };
-  } catch {
-    return { outages: {} };
-  }
-}
-
-function writeStore(store: OutageStore): void {
-  try {
-    fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-    const tmp = `${STATE_PATH}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(store, null, 2), "utf-8");
-    fs.renameSync(tmp, STATE_PATH);
-  } catch {
-    // Advisory state: losing it costs at most one duplicate alert.
-  }
-}
-
 /** The outage in progress for a scope, if any. */
 export function activeClaudeAuthOutage(scope: string): ClaudeAuthOutage | undefined {
   return readStore().outages[scope];
@@ -101,35 +42,114 @@ export interface AuthFailureNote {
 }
 
 /**
- * Record a launch that reached Claude Code and was refused as unauthenticated.
+ * Open the outage for a scope, or extend the one already open.
  *
- * A failure on credentials DIFFERENT from the ones already on record opens a
- * new outage rather than extending the old one: it means someone logged in
- * since and it still does not work, which the operator needs to hear again.
+ * A failure reached Claude Code and came back refused; a skip is a launch
+ * preflight never made. Both are evidence the login is down and both can OPEN
+ * the outage — the disk can condemn a login without any launch reaching the API.
+ *
+ * An event on credentials DIFFERENT from the ones on record opens a NEW outage:
+ * someone logged in since and it still fails, which the operator must hear again.
  */
+function openOrExtendOutage(
+  scope: string,
+  reason: string,
+  fingerprint: string | undefined,
+  counts: "failure" | "skip",
+  now: Date,
+): AuthFailureNote {
+  const store = readStore();
+  const existing = store.outages[scope];
+  const at = now.toISOString();
+  const failed = counts === "failure";
+  const extend = extendsOutage(existing, fingerprint);
+  const outage = extend && existing
+    ? extendedOutage(existing, reason, failed, at)
+    : freshOutage(reason, fingerprint, failed, at);
+  writeStore({ ...store, outages: { ...store.outages, [scope]: outage } });
+  return { outage, opened: !extend };
+}
+
+/** Whether an event on this pair belongs to the outage on record. An unknown
+ *  fingerprint on either side counts as the same: a remote scope never has one. */
+function extendsOutage(existing: ClaudeAuthOutage | undefined, fingerprint: string | undefined): boolean {
+  if (existing === undefined) return false;
+  return existing.credentialFingerprint === undefined
+    || fingerprint === undefined
+    || existing.credentialFingerprint === fingerprint;
+}
+
+/** Only a failure moves `lastFailureAt`/`lastReason` — see noteClaudeAuthSkipped. */
+function extendedOutage(existing: ClaudeAuthOutage, reason: string, failed: boolean, at: string): ClaudeAuthOutage {
+  return {
+    ...existing,
+    failures: existing.failures + (failed ? 1 : 0),
+    skipped: existing.skipped + (failed ? 0 : 1),
+    ...(failed ? { lastFailureAt: at, lastReason: reason } : {}),
+  };
+}
+
+function freshOutage(reason: string, fingerprint: string | undefined, failed: boolean, at: string): ClaudeAuthOutage {
+  return {
+    since: at,
+    failures: failed ? 1 : 0,
+    skipped: failed ? 0 : 1,
+    lastFailureAt: at,
+    lastReason: reason,
+    ...(fingerprint ? { credentialFingerprint: fingerprint } : {}),
+  };
+}
+
+/** Record a launch that reached Claude Code and was refused as unauthenticated. */
 export function noteClaudeAuthFailure(
   scope: string,
   reason: string,
   fingerprint: string | undefined,
   now: Date = new Date(),
 ): AuthFailureNote {
+  return openOrExtendOutage(scope, reason, fingerprint, "failure", now);
+}
+
+/**
+ * Record a launch preflight refused. Opens the outage when none is open — the
+ * only way a disk verdict (no credentials file, a refresh token past its own
+ * expiry) is ever announced, since preflight refuses those from the first turn
+ * and no launch ever reaches Claude Code to fail.
+ *
+ * `lastFailureAt` deliberately does NOT move: the recheck window is measured
+ * from it, and a refusal is not a re-probe. Letting a skip push it out would
+ * make the block self-perpetuating.
+ */
+export function noteClaudeAuthSkipped(
+  scope: string,
+  reason: string,
+  fingerprint: string | undefined,
+  now: Date = new Date(),
+): AuthFailureNote {
+  return openOrExtendOutage(scope, reason, fingerprint, "skip", now);
+}
+
+/**
+ * Take responsibility for alerting on this scope's outage, once. True for
+ * exactly one caller: the stamp is written synchronously, before any send
+ * begins, so turns failing while an alert is in flight see it and stay quiet.
+ * Delivery then calls `markClaudeAuthAlerted` or `releaseClaudeAuthAlert`.
+ */
+export function claimClaudeAuthAlert(scope: string, now: Date = new Date()): boolean {
   const store = readStore();
-  const existing = store.outages[scope];
-  const at = now.toISOString();
-  const sameCredentials = existing !== undefined
-    && (existing.credentialFingerprint === undefined || fingerprint === undefined || existing.credentialFingerprint === fingerprint);
-  const outage: ClaudeAuthOutage = existing && sameCredentials
-    ? { ...existing, failures: existing.failures + 1, lastFailureAt: at, lastReason: reason }
-    : {
-      since: at,
-      failures: 1,
-      skipped: 0,
-      lastFailureAt: at,
-      lastReason: reason,
-      ...(fingerprint ? { credentialFingerprint: fingerprint } : {}),
-    };
-  writeStore({ ...store, outages: { ...store.outages, [scope]: outage } });
-  return { outage, opened: !(existing && sameCredentials) };
+  const outage = store.outages[scope];
+  if (!outage || outage.alertedAt || outage.alertClaimedAt) return false;
+  writeStore({ ...store, outages: { ...store.outages, [scope]: { ...outage, alertClaimedAt: now.toISOString() } } });
+  return true;
+}
+
+/** The alert did not land: let the next failure on this outage try again. */
+export function releaseClaudeAuthAlert(scope: string): void {
+  const store = readStore();
+  const outage = store.outages[scope];
+  if (!outage) return;
+  const { alertClaimedAt: _dropped, ...rest } = outage;
+  writeStore({ ...store, outages: { ...store.outages, [scope]: rest } });
 }
 
 /** The operator has been told about the outage that is open for this scope. */
@@ -138,14 +158,6 @@ export function markClaudeAuthAlerted(scope: string, now: Date = new Date()): vo
   const outage = store.outages[scope];
   if (!outage) return;
   writeStore({ ...store, outages: { ...store.outages, [scope]: { ...outage, alertedAt: now.toISOString() } } });
-}
-
-/** A launch preflight refused because the outage already proved these credentials dead. */
-export function noteClaudeAuthSkipped(scope: string): void {
-  const store = readStore();
-  const outage = store.outages[scope];
-  if (!outage) return;
-  writeStore({ ...store, outages: { ...store.outages, [scope]: { ...outage, skipped: outage.skipped + 1 } } });
 }
 
 /**
@@ -209,11 +221,15 @@ function provenDeadVerdict(status: ClaudeCredentialStatus, scope: string, hostna
 }
 
 /**
- * Whether to warn that the refresh token is about to expire, recording the
- * warning so the same expiry is announced once. A later login moves the
+ * Take the one warning this refresh-token expiry gets. A later login moves the
  * expiry, which re-arms the warning for the new one.
+ *
+ * Claimed rather than merely asked: the marker must be written before delivery
+ * (the 15-minute tick would otherwise re-send while the first is in flight),
+ * but burning it on a dropped alert spends the only heads-up on nobody — so a
+ * failed send releases it.
  */
-export function shouldWarnRefreshExpiry(status: ClaudeCredentialStatus, now: Date = new Date()): boolean {
+export function claimRefreshExpiryWarning(status: ClaudeCredentialStatus, now: Date = new Date()): boolean {
   const expiresAt = status.refreshExpiresAt;
   if (expiresAt === undefined || status.state === "refresh-expired" || status.state === "env") return false;
   if (expiresAt - now.getTime() > CLAUDE_REFRESH_EXPIRY_WARNING_MS) return false;
@@ -223,78 +239,10 @@ export function shouldWarnRefreshExpiry(status: ClaudeCredentialStatus, now: Dat
   return true;
 }
 
-function describeDuration(ms: number): string {
-  const minutes = Math.max(1, Math.round(ms / 60_000));
-  if (minutes < 60) return `${minutes} min`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return rest ? `${hours} h ${rest} min` : `${hours} h`;
-}
-
-function describeScope(scope: string, hostname: string): string {
-  return scope === LOCAL_CLAUDE_AUTH_SCOPE ? `the gateway host (${hostname})` : scope;
-}
-
-/** The line of the alert that says what the file looked like when it failed. */
-function describeCredentialFailure(status: ClaudeCredentialStatus | undefined): string | undefined {
-  if (!status) return undefined;
-  const iso = (ms: number) => new Date(ms).toISOString();
-  if (status.state === "access-expired" && status.accessExpiresAt) {
-    const refresh = status.refreshExpiresAt
-      ? ` (the refresh token itself is valid until ${iso(status.refreshExpiresAt)}, so it was refused, not expired)`
-      : "";
-    return `The access token expired at ${iso(status.accessExpiresAt)} and Claude Code could not refresh it${refresh}.`;
-  }
-  if (status.state === "refresh-expired") {
-    return `The login itself expired${status.refreshExpiresAt ? ` on ${iso(status.refreshExpiresAt)}` : ""}.`;
-  }
-  if (status.state === "missing") return `There is no credentials file${status.path ? ` at ${status.path}` : ""}.`;
-  return undefined;
-}
-
-/** The line of the alert that says what to do. */
-function describeFix(scope: string, hostname: string, telegramLogin: boolean): string {
-  if (scope !== LOCAL_CLAUDE_AUTH_SCOPE) {
-    return `Fix: run \`claude auth login\` on ${scope} as the user the remote sessions run as. One message follows when it recovers.`;
-  }
-  const viaTelegram = telegramLogin ? ", or send `/auth claude` to this bot" : "";
-  return `Fix: run \`claude auth login\` on ${hostname} as the gateway user${viaTelegram}.`
-    + " Claude launches are skipped until the credentials change (re-probed hourly); one message follows when it recovers.";
-}
-
-/** The one message an outage sends when it opens. Says what broke, what it
- *  costs, and the exact command that fixes it, because the log line it
- *  replaces said none of that to anyone. */
-export function claudeAuthFailureAlert(
-  scope: string,
-  outage: ClaudeAuthOutage,
-  status: ClaudeCredentialStatus | undefined,
-  hostname: string,
-  options: { telegramLogin?: boolean } = {},
-): string {
-  return [
-    `🔐 Claude authentication failed on ${describeScope(scope, hostname)}: ${outage.lastReason}.`,
-    "Every Claude turn there — cron jobs included — will fail until this is fixed; nothing else in the gateway can refresh it.",
-    describeCredentialFailure(status),
-    describeFix(scope, hostname, options.telegramLogin === true),
-  ].filter((line): line is string => line !== undefined).join("\n");
-}
-
-/** The one message an outage sends when it closes. */
-export function claudeAuthRecoveredNotice(scope: string, outage: ClaudeAuthOutage, hostname: string, now: Date = new Date()): string {
-  const since = Date.parse(outage.since);
-  const lasted = Number.isFinite(since) ? describeDuration(now.getTime() - since) : "an unknown time";
-  const cost = [`${outage.failures} turn${outage.failures === 1 ? "" : "s"} failed`]
-    .concat(outage.skipped ? [`${outage.skipped} launch${outage.skipped === 1 ? "" : "es"} skipped`] : [])
-    .join(", ");
-  return `✅ Claude authentication recovered on ${describeScope(scope, hostname)} after ${lasted} (since ${outage.since}): ${cost}.`;
-}
-
-/** The heads-up before the refresh token lapses — the one expiry that is
- *  predictable from the file and that no launch can fix. */
-export function claudeRefreshExpiryWarning(status: ClaudeCredentialStatus, hostname: string, now: Date = new Date()): string {
-  const expiresAt = status.refreshExpiresAt ?? now.getTime();
-  return `⚠️ The Claude login on ${hostname} expires in ${describeDuration(expiresAt - now.getTime())}`
-    + ` (${new Date(expiresAt).toISOString()}). Run \`claude auth login\` there as the gateway user before then,`
-    + " or every Claude turn and cron job will fail.";
+/** The warning did not land: let the next tick announce this expiry again. */
+export function releaseRefreshExpiryWarning(status: ClaudeCredentialStatus): void {
+  const store = readStore();
+  if (store.refreshExpiryWarnedFor !== status.refreshExpiresAt) return;
+  const { refreshExpiryWarnedFor: _dropped, ...rest } = store;
+  writeStore(rest);
 }

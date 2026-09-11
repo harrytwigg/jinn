@@ -14,14 +14,19 @@ vi.mock("../../shared/paths.js", async (importOriginal) => ({
 const hoisted = vi.hoisted(() => ({
   sent: [] as string[],
   deliver: true,
+  /** Delivery callbacks not yet run — `settle()` drains them. */
+  pending: [] as (() => void)[],
   status: { state: "access-expired", fingerprint: "pair-A", accessExpiresAt: 1, refreshExpiresAt: 2 } as ClaudeCredentialStatus,
   config: { connectors: {} } as Record<string, unknown>,
 }));
 
+// Delivery is a promise in production, so `onResult` lands on a later tick.
+// The suite keeps that shape: a mock that confirms synchronously hides the
+// window in which a burst of failures all see "nobody has alerted yet".
 vi.mock("../callbacks.js", () => ({
-  notifyOperatorChannel: vi.fn((message: string, onSent?: () => void) => {
+  notifyOperatorChannel: vi.fn((message: string, onResult?: (sent: boolean) => void) => {
     hoisted.sent.push(message);
-    if (hoisted.deliver) onSent?.();
+    hoisted.pending.push(() => onResult?.(hoisted.deliver));
   }),
 }));
 vi.mock("../../shared/engine-health.js", () => ({ recordEngineUnavailable: vi.fn() }));
@@ -54,9 +59,16 @@ const remoteDev: Employee = {
   engine: "claude", model: "opus", persona: "", remoteHost: "buildbox", remoteUser: "dev", remoteCwd: "/srv/jinn-work/main",
 };
 
+/** Run the delivery callbacks the operator channel still owes us. */
+const settle = () => {
+  const due = hoisted.pending.splice(0);
+  for (const run of due) run();
+};
+
 beforeEach(() => {
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
   hoisted.sent.length = 0;
+  hoisted.pending.length = 0;
   hoisted.deliver = true;
   hoisted.status = { state: "access-expired", fingerprint: "pair-A", accessExpiresAt: 1, refreshExpiresAt: 2 };
   hoisted.config = { connectors: {} };
@@ -83,10 +95,14 @@ describe("isClaudeAuthFailure / claudeAuthScope", () => {
 });
 
 describe("observeClaudeTurnOutcome", () => {
+  // GEN-53 review: none of these 42 settle their delivery, so every one of
+  // them is a turn that failed while the first alert was still in flight —
+  // six cron jobs firing at 02:00 is exactly this shape.
   it("alerts once for an outage of many failures, then once on recovery", () => {
     for (let i = 0; i < 42; i++) observeClaudeTurnOutcome(undefined, AUTH_FAILED, at(i * 60_000));
 
     expect(hoisted.sent).toHaveLength(1);
+    settle();
     expect(hoisted.sent[0]).toContain("🔐 Claude authentication failed on the gateway host");
     expect(hoisted.sent[0]).toContain("claude auth login");
     expect(activeClaudeAuthOutage(LOCAL_CLAUDE_AUTH_SCOPE)).toMatchObject({ failures: 42, credentialFingerprint: "pair-A" });
@@ -121,11 +137,16 @@ describe("observeClaudeTurnOutcome", () => {
   it("retries the alert on the next failure when the first did not deliver", () => {
     hoisted.deliver = false;
     observeClaudeTurnOutcome(undefined, AUTH_FAILED, NOW);
+    settle();
     observeClaudeTurnOutcome(undefined, AUTH_FAILED, at(60_000));
+    settle();
     expect(hoisted.sent).toHaveLength(2);
+
     hoisted.deliver = true;
     observeClaudeTurnOutcome(undefined, AUTH_FAILED, at(120_000));
+    settle();
     observeClaudeTurnOutcome(undefined, AUTH_FAILED, at(180_000));
+    settle();
     expect(hoisted.sent).toHaveLength(3);
   });
 
@@ -171,6 +192,43 @@ describe("refuseClaudeLaunch", () => {
     expect(refuseClaudeLaunch(undefined, NOW)).toContain("not logged in");
   });
 
+  // GEN-53 review: a disk verdict is refused from the very first turn, so no
+  // launch ever reaches Claude Code to fail. Alerting only from the failure
+  // path left this state refused forever and never announced.
+  it("opens the outage and alerts on a disk verdict no launch could ever report", () => {
+    hoisted.status = { state: "missing", path: "/home/h/.claude/.credentials.json" };
+
+    refuseClaudeLaunch(undefined, NOW);
+    settle();
+
+    expect(hoisted.sent).toHaveLength(1);
+    expect(hoisted.sent[0]).toContain("🔐 Claude authentication failed on the gateway host");
+    expect(hoisted.sent[0]).toContain("There is no credentials file at /home/h/.claude/.credentials.json");
+    expect(hoisted.sent[0]).toContain("claude auth login");
+    // And new sessions are steered off Claude, which only the failure path did.
+    expect(recordEngineUnavailable).toHaveBeenCalledWith("claude", expect.stringContaining("claude auth login"), expect.any(Number), NOW);
+
+    // Every later refusal is counted, and stays quiet.
+    refuseClaudeLaunch(undefined, at(60_000));
+    refuseClaudeLaunch(undefined, at(120_000));
+    settle();
+    expect(hoisted.sent).toHaveLength(1);
+    expect(activeClaudeAuthOutage(LOCAL_CLAUDE_AUTH_SCOPE)).toMatchObject({ failures: 0, skipped: 3 });
+  });
+
+  it("closes a disk-verdict outage and says what it cost once a login lands", () => {
+    hoisted.status = { state: "missing", path: "/home/h/.claude/.credentials.json" };
+    refuseClaudeLaunch(undefined, NOW);
+    settle();
+
+    hoisted.status = { state: "ok", fingerprint: "pair-B", accessExpiresAt: 3, refreshExpiresAt: 4 };
+    expect(refuseClaudeLaunch(undefined, at(60 * 60_000))).toBeUndefined();
+
+    expect(hoisted.sent.at(-1)).toContain("✅ Claude authentication recovered");
+    expect(hoisted.sent.at(-1)).toContain("1 launch skipped");
+    expect(activeClaudeAuthOutage(LOCAL_CLAUDE_AUTH_SCOPE)).toBeUndefined();
+  });
+
   it("never refuses a remote employee: its credentials are on a host this one cannot read", () => {
     hoisted.status = { state: "missing" };
     observeClaudeTurnOutcome(remoteDev, AUTH_FAILED, NOW);
@@ -195,9 +253,32 @@ describe("checkClaudeRefreshExpiry", () => {
   it("warns once, ahead of the refresh token's expiry", () => {
     hoisted.status = { state: "ok", fingerprint: "pair-A", refreshExpiresAt: NOW.getTime() + 24 * 60 * 60_000 };
     checkClaudeRefreshExpiry(NOW);
+    settle();
     checkClaudeRefreshExpiry(at(60_000));
     expect(hoisted.sent).toHaveLength(1);
     expect(hoisted.sent[0]).toContain("⚠️ The Claude login on");
     expect(hoisted.sent[0]).toContain("expires in 24 h");
+  });
+
+  // GEN-53 review: the marker has to be written before the send (the tick
+  // would otherwise re-announce while the first is in flight), so a dropped
+  // alert must hand it back — this expiry gets one warning and an instance
+  // with no operator channel was spending it on nobody.
+  it("announces the expiry again when the warning did not land", () => {
+    hoisted.status = { state: "ok", fingerprint: "pair-A", refreshExpiresAt: NOW.getTime() + 24 * 60 * 60_000 };
+    hoisted.deliver = false;
+
+    checkClaudeRefreshExpiry(NOW);
+    settle();
+    expect(hoisted.sent).toHaveLength(1);
+
+    hoisted.deliver = true;
+    checkClaudeRefreshExpiry(at(15 * 60_000));
+    settle();
+    expect(hoisted.sent).toHaveLength(2);
+
+    // And once it lands, it is spent again.
+    checkClaudeRefreshExpiry(at(30 * 60_000));
+    expect(hoisted.sent).toHaveLength(2);
   });
 });

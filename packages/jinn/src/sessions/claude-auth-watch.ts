@@ -8,17 +8,23 @@ import {
   CLAUDE_AUTH_RECHECK_MS,
   LOCAL_CLAUDE_AUTH_SCOPE,
   activeClaudeAuthOutage,
-  claudeAuthFailureAlert,
-  claudeAuthRecoveredNotice,
+  claimClaudeAuthAlert,
+  claimRefreshExpiryWarning,
   claudeLaunchBlocked,
-  claudeRefreshExpiryWarning,
   markClaudeAuthAlerted,
   noteClaudeAuthFailure,
   noteClaudeAuthOk,
   noteClaudeAuthSkipped,
-  shouldWarnRefreshExpiry,
+  releaseClaudeAuthAlert,
+  releaseRefreshExpiryWarning,
+  type AuthFailureNote,
   type ClaudeAuthOutage,
 } from "../shared/claude-auth-outage.js";
+import {
+  claudeAuthFailureAlert,
+  claudeAuthRecoveredNotice,
+  claudeRefreshExpiryWarning,
+} from "../shared/claude-auth-messages.js";
 import type { Employee } from "../shared/types.js";
 import { notifyOperatorChannel } from "./callbacks.js";
 
@@ -74,12 +80,17 @@ function localStatus(): ClaudeCredentialStatus | undefined {
   }
 }
 
-/** Ask the operator channel; a failure to deliver is logged, never raised. */
-function tell(message: string, onSent?: () => void): void {
+/**
+ * Ask the operator channel; a failure to deliver is logged, never raised.
+ * `onResult` sees whether the message landed — a synchronous throw counts as
+ * not landing, so a caller holding a one-shot claim always gets to release it.
+ */
+function tell(message: string, onResult?: (sent: boolean) => void): void {
   try {
-    notifyOperatorChannel(message, onSent);
+    notifyOperatorChannel(message, onResult);
   } catch (err) {
     logger.warn(`Claude auth alert not sent: ${err instanceof Error ? err.message : String(err)}`);
+    onResult?.(false);
   }
 }
 
@@ -102,26 +113,53 @@ export function observeClaudeTurnOutcome(employee: Employee | undefined, error: 
   }
 }
 
-function reportClaudeAuthFailure(scope: string, reason: string, now: Date): void {
-  const local = scope === LOCAL_CLAUDE_AUTH_SCOPE;
-  const status = local ? localStatus() : undefined;
-  const { outage, opened } = noteClaudeAuthFailure(scope, reason, status?.fingerprint, now);
-  if (local) {
+/**
+ * Everything an outage event does beyond its ledger write: steer new sessions
+ * off the engine, and get the one operator message out.
+ *
+ * Shared by the two ways an outage is learned — a launch that came back
+ * refused, and a launch preflight would not make — because a disk verdict (no
+ * credentials file, a refresh token past its own expiry) is refused from the
+ * very first turn, so it is the ONLY evidence that outage will ever produce.
+ * Alerting only from the failure path left those two states permanently
+ * refused and permanently silent.
+ */
+interface ClaudeAuthOutageEvent {
+  scope: string;
+  note: AuthFailureNote;
+  /** The credentials this host can read, when it is this host's login. */
+  status: ClaudeCredentialStatus | undefined;
+  reason: string;
+  /** A launch that came back refused, or one preflight would not make. */
+  kind: "failure" | "refusal";
+}
+
+function raiseClaudeAuthOutage({ scope, note, status, reason, kind }: ClaudeAuthOutageEvent, now: Date): void {
+  if (scope === LOCAL_CLAUDE_AUTH_SCOPE) {
     // Advisory: new sessions prefer a healthy fallback engine while this
     // stands, and the dashboard shows why. Preflight, not this record, is
-    // what actually refuses a launch.
+    // what actually refuses a launch. Re-stamped on a refusal too, so the
+    // record cannot lapse into "ok" while every launch is still being refused.
     recordEngineUnavailable("claude", `authentication failed — run \`claude auth login\` on ${hostname()}`,
       Math.floor((now.getTime() + CLAUDE_AUTH_RECHECK_MS) / 1000), now);
   }
-  const host = hostname();
-  if (opened || !outage.alertedAt) {
-    logger.error(`Claude authentication failed on ${scope}: ${reason} — alerting the operator`
-      + (opened ? "" : " (earlier alert did not send)"));
-    tell(claudeAuthFailureAlert(scope, outage, status, host, { telegramLogin: telegramLoginAvailable() }),
-      () => markClaudeAuthAlerted(scope, now));
-  } else {
-    logger.warn(`Claude authentication still failing on ${scope} (${outage.failures} failures since ${outage.since}): ${reason}`);
+  if (!claimClaudeAuthAlert(scope, now)) {
+    const tally = `${note.outage.failures} failed, ${note.outage.skipped} skipped since ${note.outage.since}`;
+    if (kind === "failure") logger.warn(`Claude authentication still failing on ${scope} (${tally}): ${reason}`);
+    else logger.debug(`Claude launch refused on ${scope} (${tally})`);
+    return;
   }
+  logger.error(`Claude authentication is down on ${scope}: ${reason} — alerting the operator`);
+  tell(
+    claudeAuthFailureAlert(scope, note.outage, status, hostname(), { telegramLogin: telegramLoginAvailable() }),
+    (sent) => (sent ? markClaudeAuthAlerted(scope, now) : releaseClaudeAuthAlert(scope)),
+  );
+}
+
+function reportClaudeAuthFailure(scope: string, reason: string, now: Date): void {
+  const status = scope === LOCAL_CLAUDE_AUTH_SCOPE ? localStatus() : undefined;
+  const note = noteClaudeAuthFailure(scope, reason, status?.fingerprint, now);
+  raiseClaudeAuthOutage({ scope, note, status, reason, kind: "failure" }, now);
 }
 
 function reportClaudeAuthOk(scope: string, now: Date): void {
@@ -156,7 +194,13 @@ export function refuseClaudeLaunch(employee: Employee | undefined, now: Date = n
       return undefined;
     }
     const blocked = claudeLaunchBlocked(status, scope, hostname(), now);
-    if (blocked) noteClaudeAuthSkipped(scope);
+    // A refusal is evidence in its own right, not just a tally on someone
+    // else's outage: when the disk condemns the login outright no launch ever
+    // reaches Claude Code, so this is what opens the outage and alerts.
+    if (blocked) {
+      const note = noteClaudeAuthSkipped(scope, blocked, status.fingerprint, now);
+      raiseClaudeAuthOutage({ scope, note, status, reason: blocked, kind: "refusal" }, now);
+    }
     return blocked;
   } catch (err) {
     logger.warn(`Claude auth preflight skipped: ${err instanceof Error ? err.message : String(err)}`);
@@ -191,10 +235,12 @@ export function observeClaudeCredentialsValid(now: Date = new Date()): void {
 export function checkClaudeRefreshExpiry(now: Date = new Date()): void {
   try {
     const status = localStatus();
-    if (!status || !shouldWarnRefreshExpiry(status, now)) return;
+    if (!status || !claimRefreshExpiryWarning(status, now)) return;
     const message = claudeRefreshExpiryWarning(status, hostname(), now);
     logger.warn(message);
-    tell(message);
+    // This expiry gets one warning. If it does not land, hand it back so the
+    // next tick can try again rather than spending it on a dropped alert.
+    tell(message, (sent) => { if (!sent) releaseRefreshExpiryWarning(status); });
   } catch (err) {
     logger.warn(`Claude refresh-expiry check failed: ${err instanceof Error ? err.message : String(err)}`);
   }

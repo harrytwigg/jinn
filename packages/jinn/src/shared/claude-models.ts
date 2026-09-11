@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import type { ModelInfo } from "./types.js";
 import { resolveClaudeConfigDir } from "./home.js";
-import { parseClaudeCredentials } from "./claude-auth.js";
+import { ClaudeCatalogRequestError, parseClaudeCredentials } from "./claude-auth.js";
 
 export const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 export const CLAUDE_ALIAS_IDS = ["opus", "sonnet", "fable"] as const;
@@ -323,6 +323,6 @@ export async function discoverClaudeModels(options: {
       "anthropic-version": "2023-06-01",
     },
   });
-  if (!res.ok) throw new Error(`Anthropic model catalog request failed: ${res.status} ${res.statusText}`);
+  if (!res.ok) throw new ClaudeCatalogRequestError(res.status, res.statusText);
   return parseAnthropicModels(await res.json(), { effortLevels: options.effortLevels });
 }

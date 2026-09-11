@@ -15,16 +15,21 @@ import {
   CLAUDE_REFRESH_EXPIRY_WARNING_MS,
   LOCAL_CLAUDE_AUTH_SCOPE,
   activeClaudeAuthOutage,
-  claudeAuthFailureAlert,
-  claudeAuthRecoveredNotice,
+  claimClaudeAuthAlert,
+  claimRefreshExpiryWarning,
   claudeLaunchBlocked,
-  claudeRefreshExpiryWarning,
   markClaudeAuthAlerted,
   noteClaudeAuthFailure,
   noteClaudeAuthOk,
   noteClaudeAuthSkipped,
-  shouldWarnRefreshExpiry,
+  releaseClaudeAuthAlert,
+  releaseRefreshExpiryWarning,
 } from "../claude-auth-outage.js";
+import {
+  claudeAuthFailureAlert,
+  claudeAuthRecoveredNotice,
+  claudeRefreshExpiryWarning,
+} from "../claude-auth-messages.js";
 import type { ClaudeCredentialStatus } from "../claude-auth.js";
 
 const STATE_PATH = path.join(TEST_HOME, "tmp", "claude-auth-outage.json");
@@ -87,8 +92,8 @@ describe("noteClaudeAuthFailure", () => {
 describe("noteClaudeAuthOk / noteClaudeAuthSkipped / markClaudeAuthAlerted", () => {
   it("closes the outage once, returning it with what it cost", () => {
     noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", NOW);
-    noteClaudeAuthSkipped(LOCAL);
-    noteClaudeAuthSkipped(LOCAL);
+    noteClaudeAuthSkipped(LOCAL, "refused", "pair-A", at(60_000));
+    noteClaudeAuthSkipped(LOCAL, "refused", "pair-A", at(120_000));
     markClaudeAuthAlerted(LOCAL, at(1000));
 
     const closed = noteClaudeAuthOk(LOCAL);
@@ -97,11 +102,68 @@ describe("noteClaudeAuthOk / noteClaudeAuthSkipped / markClaudeAuthAlerted", () 
     expect(activeClaudeAuthOutage(LOCAL)).toBeUndefined();
   });
 
-  it("is free when there is nothing to close", () => {
+  it("is free when there is nothing to close or alert on", () => {
     expect(noteClaudeAuthOk(LOCAL)).toBeUndefined();
-    noteClaudeAuthSkipped(LOCAL);
     markClaudeAuthAlerted(LOCAL);
+    expect(claimClaudeAuthAlert(LOCAL, NOW)).toBe(false);
     expect(fs.existsSync(STATE_PATH)).toBe(false);
+  });
+
+  // GEN-53 review: a disk verdict — no credentials file, a refresh token past
+  // its own expiry — is refused in preflight from the very first turn, so no
+  // launch ever reaches Claude Code to fail. The refusal has to be able to
+  // open the outage, or those two states are refused forever in silence.
+  it("opens the outage on a refusal when no launch ever got through to fail", () => {
+    const first = noteClaudeAuthSkipped(LOCAL, "no credentials file", undefined, NOW);
+    expect(first.opened).toBe(true);
+    expect(first.outage).toMatchObject({ since: NOW.toISOString(), failures: 0, skipped: 1 });
+
+    const second = noteClaudeAuthSkipped(LOCAL, "no credentials file", undefined, at(60_000));
+    expect(second.opened).toBe(false);
+    expect(second.outage).toMatchObject({ failures: 0, skipped: 2 });
+  });
+
+  it("does not let a refusal push out the recheck window it is measured from", () => {
+    noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", NOW);
+    noteClaudeAuthSkipped(LOCAL, "refused", "pair-A", at(30 * 60_000));
+    // Still the failure's own timestamp: a skip is not a re-probe, and letting
+    // it move the clock would make the block self-perpetuating.
+    expect(activeClaudeAuthOutage(LOCAL)?.lastFailureAt).toBe(NOW.toISOString());
+    expect(claudeLaunchBlocked(expired, LOCAL, HOST, at(CLAUDE_AUTH_RECHECK_MS))).toBeUndefined();
+  });
+});
+
+// GEN-53 review: delivery is async, so several turns can fail inside one
+// in-flight alert. The claim is the debounce; `alertedAt` only records that it
+// landed, and by then the storm has already been sent.
+describe("claimClaudeAuthAlert / releaseClaudeAuthAlert", () => {
+  it("gives the alert to exactly one of a burst of concurrent failures", () => {
+    noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", NOW);
+    const claims = [0, 1, 2, 3, 4, 5].map((i) => {
+      noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", at(i));
+      return claimClaudeAuthAlert(LOCAL, at(i));
+    });
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect(activeClaudeAuthOutage(LOCAL)?.failures).toBe(7);
+  });
+
+  it("hands the alert back when it did not land, and holds it once it did", () => {
+    noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", NOW);
+    expect(claimClaudeAuthAlert(LOCAL, NOW)).toBe(true);
+    releaseClaudeAuthAlert(LOCAL);
+
+    expect(claimClaudeAuthAlert(LOCAL, at(60_000))).toBe(true);
+    markClaudeAuthAlerted(LOCAL, at(60_000));
+    expect(claimClaudeAuthAlert(LOCAL, at(120_000))).toBe(false);
+  });
+
+  it("re-arms for a new outage, so a login that still fails is announced again", () => {
+    noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", NOW);
+    claimClaudeAuthAlert(LOCAL, NOW);
+    markClaudeAuthAlerted(LOCAL, NOW);
+
+    noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-B", at(HOUR));
+    expect(claimClaudeAuthAlert(LOCAL, at(HOUR))).toBe(true);
   });
 });
 
@@ -145,20 +207,35 @@ describe("claudeLaunchBlocked", () => {
   });
 });
 
-describe("shouldWarnRefreshExpiry", () => {
+describe("claimRefreshExpiryWarning", () => {
   const soon: ClaudeCredentialStatus = { ...expired, state: "ok", refreshExpiresAt: NOW.getTime() + CLAUDE_REFRESH_EXPIRY_WARNING_MS - 1 };
 
   it("warns once per expiry, and again for a new one", () => {
-    expect(shouldWarnRefreshExpiry(soon, NOW)).toBe(true);
-    expect(shouldWarnRefreshExpiry(soon, at(HOUR))).toBe(false);
-    expect(shouldWarnRefreshExpiry({ ...soon, refreshExpiresAt: soon.refreshExpiresAt! + HOUR }, at(2 * HOUR))).toBe(true);
+    expect(claimRefreshExpiryWarning(soon, NOW)).toBe(true);
+    expect(claimRefreshExpiryWarning(soon, at(HOUR))).toBe(false);
+    expect(claimRefreshExpiryWarning({ ...soon, refreshExpiresAt: soon.refreshExpiresAt! + HOUR }, at(2 * HOUR))).toBe(true);
   });
 
-  it("stays quiet when the expiry is far off, already past, unstated, or irrelevant", () => {
-    expect(shouldWarnRefreshExpiry({ ...soon, refreshExpiresAt: NOW.getTime() + CLAUDE_REFRESH_EXPIRY_WARNING_MS + 1 }, NOW)).toBe(false);
-    expect(shouldWarnRefreshExpiry({ ...soon, state: "refresh-expired" }, NOW)).toBe(false);
-    expect(shouldWarnRefreshExpiry({ state: "env" }, NOW)).toBe(false);
-    expect(shouldWarnRefreshExpiry({ state: "missing" }, NOW)).toBe(false);
+  it("stays quiet when the expiry is far off, unstated, or irrelevant", () => {
+    expect(claimRefreshExpiryWarning({ ...soon, refreshExpiresAt: NOW.getTime() + CLAUDE_REFRESH_EXPIRY_WARNING_MS + 1 }, NOW)).toBe(false);
+    expect(claimRefreshExpiryWarning({ ...soon, state: "refresh-expired" }, NOW)).toBe(false);
+    expect(claimRefreshExpiryWarning({ state: "env" }, NOW)).toBe(false);
+    expect(claimRefreshExpiryWarning({ state: "missing" }, NOW)).toBe(false);
+  });
+
+  // GEN-53 review: this expiry gets ONE warning. Burning it on an alert the
+  // notification layer dropped — the incident instance resolved no operator
+  // channel at all — spends the only heads-up on nobody.
+  it("hands the warning back when it did not land", () => {
+    expect(claimRefreshExpiryWarning(soon, NOW)).toBe(true);
+    releaseRefreshExpiryWarning(soon);
+    expect(claimRefreshExpiryWarning(soon, at(15 * 60_000))).toBe(true);
+  });
+
+  it("does not hand back a warning for some other expiry", () => {
+    expect(claimRefreshExpiryWarning(soon, NOW)).toBe(true);
+    releaseRefreshExpiryWarning({ ...soon, refreshExpiresAt: soon.refreshExpiresAt! + HOUR });
+    expect(claimRefreshExpiryWarning(soon, at(15 * 60_000))).toBe(false);
   });
 });
 
@@ -186,14 +263,33 @@ describe("the messages", () => {
   it("the recovery notice says how long it lasted and what it cost", () => {
     noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", NOW);
     noteClaudeAuthFailure(LOCAL, "authentication_failed", "pair-A", at(HOUR));
-    noteClaudeAuthSkipped(LOCAL);
+    noteClaudeAuthSkipped(LOCAL, "refused", "pair-A", at(HOUR));
     const closed = noteClaudeAuthOk(LOCAL)!;
     expect(claudeAuthRecoveredNotice(LOCAL, closed, HOST, at(5 * HOUR + 19 * 60_000)))
       .toBe("✅ Claude authentication recovered on the gateway host (gateway-host) after 5 h 19 min (since 2026-09-11T02:00:00.000Z): 2 turns failed, 1 launch skipped.");
   });
 
+  it("the recovery notice reads sensibly for an outage no turn ever reached", () => {
+    noteClaudeAuthSkipped(LOCAL, "no credentials file", undefined, NOW);
+    noteClaudeAuthSkipped(LOCAL, "no credentials file", undefined, at(60_000));
+    const closed = noteClaudeAuthOk(LOCAL)!;
+    expect(claudeAuthRecoveredNotice(LOCAL, closed, HOST, at(HOUR))).toContain("2 launches skipped.");
+    expect(claudeAuthRecoveredNotice(LOCAL, closed, HOST, at(HOUR))).not.toContain("0 turns failed");
+  });
+
   it("the expiry warning gives the deadline and the fix", () => {
     const text = claudeRefreshExpiryWarning({ state: "ok", refreshExpiresAt: NOW.getTime() + 36 * HOUR }, HOST, NOW);
     expect(text).toBe("⚠️ The Claude login on gateway-host expires in 36 h (2026-09-12T14:00:00.000Z). Run `claude auth login` there as the gateway user before then, or every Claude turn and cron job will fail.");
+  });
+
+  // GEN-53 review: reachable whenever the access token outlives the refresh
+  // token — `credentialState` reports "ok" on a live access token whatever the
+  // refresh expiry says, so the warning fired with a negative span and read
+  // "expires in 1 min" off a timestamp already in the past.
+  it("the expiry warning says a lapsed deadline has gone, not that it is a minute away", () => {
+    const text = claudeRefreshExpiryWarning({ state: "ok", refreshExpiresAt: NOW.getTime() - 3 * HOUR }, HOST, NOW);
+    expect(text).toContain("expired 3 h ago and cannot be renewed");
+    expect(text).toContain("as the gateway user now, or every Claude turn");
+    expect(text).not.toContain("expires in");
   });
 });

@@ -34,7 +34,8 @@ vi.mock("../claude-auth.js", async (importOriginal) => ({
 
 import { logger } from "../logger.js";
 import { getModelRegistry, refreshClaudeModels, setDiscoveredClaudeModelsForTest } from "../models.js";
-import { describeZeroModels } from "../claude-auth.js";
+import { discoverClaudeModels } from "../claude-models.js";
+import { ClaudeCatalogRequestError, describeRefusedCatalog, describeZeroModels } from "../claude-auth.js";
 
 const config = {
   gateway: { port: 7777, host: "127.0.0.1" },
@@ -79,6 +80,33 @@ describe("refreshClaudeModels", () => {
     expect(vi.mocked(logger.warn).mock.calls.at(-1)?.[0])
       .toBe("Claude model discovery returned 0 models — no Claude credentials at /home/h/.claude/.credentials.json. Run `claude auth login` on this host; falling back to the offline alias catalog.");
   });
+
+  // GEN-53 review: the token reader never sends an access token the file says
+  // has expired, so a 401 is a revoked login — a fact about the credentials,
+  // not about the catalog. Throwing it into the generic catch dropped the
+  // catalog and said nothing useful, which is the degradation this set out to stop.
+  it("keeps the catalog and names the cause when Anthropic refuses the token", async () => {
+    hoisted.discovered = { models: [sonnet5] };
+    await refreshClaudeModels(config);
+
+    hoisted.status = { state: "ok", path: "/home/h/.claude/.credentials.json" };
+    vi.mocked(discoverClaudeModels).mockRejectedValueOnce(new ClaudeCatalogRequestError(401, "Unauthorized"));
+    await expect(refreshClaudeModels(config)).resolves.toBe(false);
+
+    expect(getModelRegistry(config).claude.models.some((m) => m.id === "claude-sonnet-5")).toBe(true);
+    expect(vi.mocked(logger.warn).mock.calls.at(-1)?.[0])
+      .toBe("Claude model discovery was refused — Anthropic refused the token on disk (/home/h/.claude/.credentials.json) with HTTP 401"
+        + " — the login has been revoked, or the account cannot reach the API. Run `claude auth login` on this host; keeping the last discovered catalog.");
+  });
+
+  it("still drops the catalog when the failure is not about the credentials", async () => {
+    hoisted.discovered = { models: [sonnet5] };
+    await refreshClaudeModels(config);
+
+    vi.mocked(discoverClaudeModels).mockRejectedValueOnce(new ClaudeCatalogRequestError(503, "Service Unavailable"));
+    await expect(refreshClaudeModels(config)).resolves.toBe(false);
+    expect(vi.mocked(logger.warn).mock.calls.at(-1)?.[0]).toContain("Claude model discovery failed: Anthropic model catalog request failed: 503");
+  });
 });
 
 describe("describeZeroModels", () => {
@@ -88,5 +116,11 @@ describe("describeZeroModels", () => {
     expect(describeZeroModels({ state: "unknown" })).toMatchObject({ level: "warn", text: expect.stringContaining("claude auth login") });
     expect(describeZeroModels({ state: "ok" }).text).not.toContain("auth login");
     expect(describeZeroModels({ state: "env" }).text).not.toContain("auth login");
+  });
+
+  it("names where the refused token came from", () => {
+    expect(describeRefusedCatalog({ state: "env" }, 403).text).toContain("the token in the environment");
+    expect(describeRefusedCatalog({ state: "ok", path: "/x/.credentials.json" }, 401).text)
+      .toContain("the token on disk (/x/.credentials.json)");
   });
 });

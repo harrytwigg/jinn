@@ -179,11 +179,72 @@ export function describeZeroModels(status: ClaudeCredentialStatus): { level: "in
   }
 }
 
-/** Log a zero-model discovery at the level its cause deserves. */
-export function logZeroClaudeModels(status: ClaudeCredentialStatus, keepingCatalog: boolean): void {
-  const reading = describeZeroModels(status);
+/**
+ * The operator-facing reading of a catalog request Anthropic refused outright.
+ *
+ * The token reader never sends an access token the file says has expired, so a
+ * 4xx here is not an expiry: the login has been revoked, or the account has
+ * lost access to the API. Either way `claude auth login` is the remedy, and
+ * the models did not stop existing — the catalog is still worth keeping.
+ */
+export function describeRefusedCatalog(status: ClaudeCredentialStatus, httpStatus: number): { level: "info" | "warn"; text: string } {
+  const token = status.state === "env"
+    ? "the token in the environment"
+    : `the token on disk${status.path ? ` (${status.path})` : ""}`;
+  return {
+    level: "warn",
+    text: `Anthropic refused ${token} with HTTP ${httpStatus} — the login has been revoked, or the account cannot reach the API.`
+      + " Run `claude auth login` on this host",
+  };
+}
+
+/**
+ * Log a Claude catalog read that produced nothing usable, at the level its
+ * cause deserves. `refusedWith` is the HTTP status when the request was
+ * refused outright rather than answered with an empty catalog.
+ */
+export function logClaudeCatalogShortfall(
+  status: ClaudeCredentialStatus,
+  keepingCatalog: boolean,
+  refusedWith?: number,
+): void {
+  const reading = refusedWith === undefined ? describeZeroModels(status) : describeRefusedCatalog(status, refusedWith);
+  const headline = refusedWith === undefined ? "returned 0 models" : "was refused";
   logger[reading.level](
-    `Claude model discovery returned 0 models — ${reading.text}`
+    `Claude model discovery ${headline} — ${reading.text}`
       + (keepingCatalog ? "; keeping the last discovered catalog." : "; falling back to the offline alias catalog."),
   );
+}
+
+/**
+ * The catalog request reached Anthropic and came back refused. Carries the
+ * status so a caller can tell a credential fact (4xx — this token is not
+ * accepted) from a transport one (5xx, a timeout, a parse failure), which want
+ * opposite things done with the catalog already in hand.
+ */
+export class ClaudeCatalogRequestError extends Error {
+  constructor(readonly status: number, statusText: string) {
+    super(`Anthropic model catalog request failed: ${status} ${statusText}`);
+    this.name = "ClaudeCatalogRequestError";
+  }
+}
+
+/**
+ * What to do with the Claude catalog already in hand when a discovery threw,
+ * reporting the cause on the way past.
+ *
+ * A 4xx is the token being refused: a fact about the login, not about the
+ * catalog. The models did not stop existing because the token was revoked, so
+ * the last good catalog is kept for exactly the reason a zero-model read keeps
+ * it — dropping it here degraded the registry to the offline "<Name> (Latest)"
+ * labels with nothing but a generic warning to say why. Anything else says
+ * nothing either way, and the catalog goes.
+ */
+export function keepClaudeCatalogAfter<T>(err: unknown, kept: T | null, status: ClaudeCredentialStatus): T | null {
+  if (err instanceof ClaudeCatalogRequestError && err.status >= 400 && err.status < 500) {
+    logClaudeCatalogShortfall(status, kept !== null, err.status);
+    return kept;
+  }
+  logger.warn(`Claude model discovery failed: ${err instanceof Error ? err.message : err}`);
+  return null;
 }

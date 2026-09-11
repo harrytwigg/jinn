@@ -7,7 +7,7 @@ import type {
   EngineModelsConfig,
 } from "./types.js";
 import { logger } from "./logger.js";
-import { logZeroClaudeModels, readClaudeCredentialStatus } from "./claude-auth.js";
+import { keepClaudeCatalogAfter, logClaudeCatalogShortfall, readClaudeCredentialStatus } from "./claude-auth.js";
 import { resolveBin, isInstalled } from "./resolve-bin.js";
 import { discoverPiModels } from "./pi-models.js";
 import {
@@ -166,10 +166,9 @@ export async function refreshClaudeModels(config: JinnConfig): Promise<boolean> 
       logger.info(`Claude model discovery: ${discovered.models.length} model(s)`);
       return true;
     }
-    logZeroClaudeModels(readClaudeCredentialStatus(), discoveredClaudeModels !== null);
+    logClaudeCatalogShortfall(readClaudeCredentialStatus(), discoveredClaudeModels !== null);
   } catch (err) {
-    logger.warn(`Claude model discovery failed: ${err instanceof Error ? err.message : err}`);
-    discoveredClaudeModels = null;
+    discoveredClaudeModels = keepClaudeCatalogAfter(err, discoveredClaudeModels, readClaudeCredentialStatus());
   } finally {
     invalidateModelRegistry();
   }
