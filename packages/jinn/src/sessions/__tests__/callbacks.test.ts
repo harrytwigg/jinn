@@ -90,6 +90,7 @@ vi.mock("../registry.js", () => ({
   recordSessionDeliveryFailure: callbackDeliveryMockState.recordFailure,
   listPendingSessionDeliveries: callbackDeliveryMockState.listPending,
   ensureCallbackAttemptToken: vi.fn(() => "legacy-attempt-token"),
+  consumeChildReportedToParent: vi.fn(() => true),
 }));
 
 vi.mock("../../work-items/store.js", () => ({
@@ -109,8 +110,8 @@ vi.mock("../../shared/logger.js", () => ({
   },
 }));
 
-import { __resetCallbackRetrySweepForTest, notifyManagerVisibility, notifyParentSession, notifyRateLimitResumed, recoverOrphanedDelegationCompletionClaims, recoverPendingSessionDeliveries } from "../callbacks.js";
-import { claimSessionDelivery, getSession, listDelegationCompletionNudgedSessions, markDelegationCompletionSurfaced } from "../registry.js";
+import { __resetCallbackRetrySweepForTest, notifyManagerVisibility, notifyParentOfExternalTurn, notifyParentSession, notifyRateLimitResumed, recoverOrphanedDelegationCompletionClaims, recoverPendingSessionDeliveries } from "../callbacks.js";
+import { claimSessionDelivery, consumeChildReportedToParent, getSession, listDelegationCompletionNudgedSessions, markDelegationCompletionSurfaced } from "../registry.js";
 import { getWorkItem } from "../../work-items/store.js";
 import type { Session } from "../../shared/types.js";
 
@@ -594,6 +595,9 @@ describe("notifyParentSession", () => {
 
     expect(claimSessionDelivery).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
+    // One relay suppresses one callback: the marker is consumed, not left to
+    // swallow every later reply of the attempt.
+    expect(consumeChildReportedToParent).toHaveBeenCalledWith("child-001", "attempt-001");
   });
 
   it("still fires the auto callback when the marker is from a stale (earlier) attempt", async () => {
@@ -820,5 +824,114 @@ describe("notifyParentSession — alwaysNotify suppression", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+});
+
+describe("notifyParentOfExternalTurn", () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.fn().mockResolvedValue({ ok: true });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    vi.mocked(consumeChildReportedToParent).mockReset().mockImplementation(() => true);
+    vi.mocked(getSession).mockImplementation((id: string) =>
+      id === "child-001" ? makeSession() : makeSession({ id: "parent-001", parentSessionId: null, status: "idle" }),
+    );
+    vi.mocked(getWorkItem).mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    globalThis.fetch = originalFetch as typeof fetch;
+  });
+
+  it("wakes the parent with the reply text, keyed apart from the settle callback of the same attempt", async () => {
+    // The settle callback for attempt-001 already went out; the child's PTY then
+    // produced another Stop (background subagent finished, model re-invoked).
+    const child = makeSession();
+    notifyParentSession(child, { result: "Own findings are drafted; persona reviewers still running." });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await notifyParentOfExternalTurn(child, "# Round 5 — Changes required\n\nP1: …", "2026-09-13T11:12:16.217Z");
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const identities = vi.mocked(claimSessionDelivery).mock.calls.map((call) => call[0]);
+    expect(identities[0]).toMatchObject({ sourceAttempt: "attempt-001", deliveryKind: "parent-completion" });
+    expect(identities[1]).toMatchObject({
+      targetSessionId: "parent-001",
+      sourceId: "child-001",
+      sourceAttempt: "attempt-001:external:2026-09-13T11:12:16.217Z",
+      sourceOutcome: "succeeded",
+      sourceVersion: 1,
+      deliveryKind: "parent-external-turn",
+    });
+    const body = JSON.parse(fetchSpy.mock.calls[1][1].body);
+    expect(fetchSpy.mock.calls[1][0]).toBe("http://127.0.0.1:7777/api/sessions/parent-001/message");
+    expect(body.role).toBe("notification");
+    expect(body.message).toContain('Employee "test-employee" replied in child session child-001');
+    expect(body.message).toContain("# Round 5 — Changes required");
+    expect(body.displayMessage).toBe("📩 test-employee replied\n# Round 5 — Changes required P1: …");
+    expect(body.meta).toMatchObject({ kind: "child-reply", employee: "test-employee", childSessionId: "child-001" });
+  });
+
+  it("gives each external reply its own durable receipt, and a redelivered Stop none", async () => {
+    const child = makeSession();
+    await notifyParentOfExternalTurn(child, "Waiting on maintainability and adversarial.", "2026-09-13T11:05:46.031Z");
+    await notifyParentOfExternalTurn(child, "Waiting on maintainability and adversarial.", "2026-09-13T11:05:46.031Z");
+    await notifyParentOfExternalTurn(child, "Adversarial reviewer still running.", "2026-09-13T11:08:37.180Z");
+
+    expect(claimSessionDelivery).toHaveBeenCalledTimes(3);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(new Set(fetchSpy.mock.calls.map((call) => JSON.parse(call[1].body).callbackDeliveryId)).size).toBe(2);
+  });
+
+  it("skips a child with no parent, an empty reply, and a parent in error", async () => {
+    await notifyParentOfExternalTurn(makeSession({ parentSessionId: null }), "orphan reply", "k1");
+    await notifyParentOfExternalTurn(makeSession(), "  \u200b ", "k2");
+    vi.mocked(getSession).mockImplementation((id: string) =>
+      id === "child-001" ? makeSession() : makeSession({ id: "parent-001", parentSessionId: null, status: "error" }),
+    );
+    await notifyParentOfExternalTurn(makeSession(), "parent is gone", "k3");
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("honours alwaysNotify: false the way the settle callback does", async () => {
+    await notifyParentOfExternalTurn(makeSession(), "quiet employee reply", "k1", { alwaysNotify: false });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("is suppressed once by an explicit relay in the same attempt, then fires again for the next reply", async () => {
+    // Round-6 shape: the child relayed its findings with send_to_session, and the
+    // Stop that ends that model turn carries a summary — a duplicate. But the
+    // marker must not also swallow a later reply of the same attempt.
+    let marker: string | undefined = "attempt-001";
+    vi.mocked(getSession).mockImplementation((id: string) =>
+      id === "child-001"
+        ? makeSession({ transportMeta: marker ? { reportedToParentAttempt: marker } : null })
+        : makeSession({ id: "parent-001", parentSessionId: null, status: "idle" }),
+    );
+    vi.mocked(consumeChildReportedToParent).mockImplementation(() => { marker = undefined; return true; });
+
+    await notifyParentOfExternalTurn(makeSession(), "Findings sent to senior-developer.", "k1");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(consumeChildReportedToParent).toHaveBeenCalledWith("child-001", "attempt-001");
+
+    await notifyParentOfExternalTurn(makeSession(), "Post-pass verification of 4bea763b: pass stands.", "k2");
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("does not apply the delegation completion contract to an external reply", async () => {
+    // A progress-only reply from a Todo child at SETTLE earns one nudge; the
+    // same words in a post-settle continuation are a follow-up, not a second
+    // settle, and must reach the parent as-is.
+    vi.mocked(getWorkItem).mockReturnValue({ id: "GEN-64", status: "executing" } as never);
+    const child = makeSession({ workItemId: "GEN-64" } as Partial<Session>);
+    await notifyParentOfExternalTurn(child, "Still waiting on two reviewers.", "k1");
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.message).toContain("Still waiting on two reviewers.");
+    expect(body.message).not.toContain("Delegation completion contract");
+    expect(body.block).toMatchObject({ op: "patch", block: { id: "dg-GEN-64", type: "delegation", status: "done" } });
   });
 });

@@ -828,10 +828,11 @@ export function clearDelegationCompletionGuard(id: string, expectedWorkItemId: s
 
 /**
  * Record that a child explicitly reported UP to its parent via send_to_session
- * during its current attempt. The automatic parent-completion callback for that
- * same attempt is a duplicate of the explicit relay, so notifyParentSession
- * suppresses it when this marker matches the child's live attempt token. The
- * marker is per-attempt: a new turn mints a new token, so it self-expires.
+ * during its current attempt. The automatic parent callback for the model turn
+ * that made that relay is a duplicate of it, so notifyParentSession suppresses
+ * the next callback whose attempt token matches and consumes the marker
+ * (consumeChildReportedToParent). The marker is per-attempt: a new turn mints a
+ * new token, so it self-expires even if nothing consumes it.
  */
 export function recordChildReportedToParent(id: string, attemptToken: string): void {
   const db = initDb();
@@ -840,6 +841,25 @@ export function recordChildReportedToParent(id: string, attemptToken: string): v
     SET transport_meta = json_set(COALESCE(transport_meta, '{}'), '$.reportedToParentAttempt', ?)
     WHERE id = ?
   `).run(attemptToken, id);
+}
+
+/**
+ * Atomically clear the relay marker if it still names `attemptToken`. Returns
+ * true when this caller consumed it — i.e. the callback it is about to skip is
+ * the relay's duplicate. One relay suppresses one callback: an attempt whose
+ * PTY keeps producing turns after settle (Claude Code re-invoking the model when
+ * a background subagent finishes) must not lose every later reply to a marker
+ * written for an earlier one.
+ */
+export function consumeChildReportedToParent(id: string, attemptToken: string): boolean {
+  const db = initDb();
+  const result = db.prepare(`
+    UPDATE sessions
+    SET transport_meta = json_remove(transport_meta, '$.reportedToParentAttempt')
+    WHERE id = ?
+      AND json_extract(transport_meta, '$.reportedToParentAttempt') = ?
+  `).run(id, attemptToken);
+  return result.changes === 1;
 }
 
 /** Persisted nudge claims whose queue post may have been lost to a restart. */

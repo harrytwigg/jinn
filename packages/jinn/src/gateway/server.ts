@@ -834,11 +834,14 @@ export async function startGateway(
 
   // Unsolicited-Stop consumer: a Stop hook nobody claims within the registry's
   // grace delay means a PTY-native turn (typed straight into the CLI/xterm
-  // view — no run() in flight) or a Stop past the late-recovery window. Persist
-  // that turn into the messages DB from the transcript tail so chat mode sees it.
+  // view — no run() in flight), a Stop past the late-recovery window, or Claude
+  // Code re-invoking the model after a background subagent finished. Persist
+  // that turn into the messages DB from the transcript tail so chat mode sees
+  // it, and wake the parent if the session has one — for a delegated child the
+  // continuation is usually the reply the parent is waiting for.
   hookRegistry.setUnclaimedHookHandler((jinnSessionId, payload) => {
     try {
-      syncExternalTurn(jinnSessionId, emit, payload);
+      syncExternalTurn(jinnSessionId, emit, payload, { resolveEmployee: (slug) => employeeRegistry.get(slug) });
     } catch (err) {
       logger.warn(`Unclaimed-Stop sync failed for session ${jinnSessionId}: ${err instanceof Error ? err.message : err}`);
     }
