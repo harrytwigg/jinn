@@ -228,6 +228,7 @@ export function buildWorkItemTools(): JinnMcpTool[] {
         dueAt: { type: "string" },
         labels: { type: "array", items: { type: "string" } },
         idempotencyKey: { type: "string" },
+        autoStart: { type: "boolean", description: "false: no Workflow auto-starts it on assignment." },
       },
       required: ["title"],
     },
@@ -255,6 +256,10 @@ export function buildWorkItemTools(): JinnMcpTool[] {
       const dueAt = optionalString(args, "dueAt", 64);
       if (dueAt !== undefined) body.dueAt = dueAt;
       if (args.labels !== undefined) body.labels = requireLabelRefs(args);
+      if (args.autoStart !== undefined) {
+        if (typeof args.autoStart !== "boolean") throw new JinnMcpToolError("autoStart must be a boolean");
+        body.autoStart = args.autoStart;
+      }
       // ICI-733: repeating the same key returns the Todo the first call made,
       // so a retried cron or connector fire cannot mint a duplicate.
       const idempotencyKey = optionalString(args, "idempotencyKey");

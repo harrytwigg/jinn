@@ -6,6 +6,7 @@ import { validateNewSessionSelection } from '../sessions/session-patch.js';
 import type { JinnConfig } from '../shared/types.js';
 import { parseTodoId } from './id.js';
 import { parseSkillsJson } from './dispatch-schema.js';
+import { readAutoStartRow, writeAutoStartRow, type AutoStartRow } from './auto-start.js';
 
 /**
  * How a Todo is RUN (ICI-733): the skills its working session preloads and the
@@ -30,6 +31,9 @@ export interface TodoDispatchConfig {
   skills: string[];
   engine: string | null;
   model: string | null;
+  /** GEN-67: false when the Todo has opted out of being auto-started by a
+   *  `todo-status` Workflow trigger on assignment. Defaults to true. */
+  autoStart: boolean;
   updatedAt: string;
 }
 
@@ -39,6 +43,7 @@ export interface TodoDispatchConfigInput {
   skills?: unknown;
   engine?: string | null;
   model?: string | null;
+  autoStart?: boolean;
 }
 
 export type TodoDispatchConfigResult =
@@ -128,21 +133,30 @@ interface DispatchRow {
   updated_at: string;
 }
 
-function rowToConfig(row: DispatchRow): TodoDispatchConfig {
+/** The newest of the two tables' stamps: the config reads as one record, so it
+ *  is "updated" whenever either half was. */
+function latestUpdatedAt(...stamps: Array<string | undefined>): string {
+  return stamps.filter((value): value is string => value !== undefined).sort().at(-1)!;
+}
+
+function rowsToConfig(row: DispatchRow | undefined, autoStart: AutoStartRow | undefined): TodoDispatchConfig {
+  const base = row ? { skills: row.skills === null ? [] : parseSkillsJson(row.skills) ?? [], engine: row.engine, model: row.model }
+    : { skills: [], engine: null, model: null };
   return {
-    skills: row.skills === null ? [] : parseSkillsJson(row.skills) ?? [],
-    engine: row.engine,
-    model: row.model,
-    updatedAt: row.updated_at,
+    ...base,
+    autoStart: autoStart === undefined || autoStart.auto_start === 1,
+    updatedAt: latestUpdatedAt(row?.updated_at, autoStart?.updated_at),
   };
 }
 
 /** The Todo's dispatch preferences, or undefined when it has none. */
 export function getTodoDispatchConfig(workItemId: string): TodoDispatchConfig | undefined {
+  const id = parseTodoId(workItemId);
   const row = initDb()
     .prepare('SELECT skills, engine, model, updated_at FROM work_item_dispatch WHERE work_item_id = ?')
-    .get(parseTodoId(workItemId)) as DispatchRow | undefined;
-  return row ? rowToConfig(row) : undefined;
+    .get(id) as DispatchRow | undefined;
+  const autoStart = readAutoStartRow(initDb(), id);
+  return row === undefined && autoStart === undefined ? undefined : rowsToConfig(row, autoStart);
 }
 
 /**
@@ -181,18 +195,41 @@ export function setTodoDispatchConfig(
   const patched = patchedOverride(current, input);
   const override = validateOverride(config, patched.engine, patched.model);
   if (!override.ok) return override;
+  const flag = patchedAutoStart(current, input);
+  if (!flag.ok) return flag;
+  const { autoStart } = flag;
 
   const updatedAt = new Date().toISOString();
-  initDb()
-    .prepare(
-      `INSERT INTO work_item_dispatch (work_item_id, skills, engine, model, updated_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(work_item_id) DO UPDATE SET
-         skills = excluded.skills, engine = excluded.engine, model = excluded.model, updated_at = excluded.updated_at`,
-    )
-    .run(id, skills.length > 0 ? JSON.stringify(skills) : null, override.engine, override.model, updatedAt);
+  const db = initDb();
+  db.transaction(() => {
+    // The two tables are written independently, so a call that touches only the
+    // flag never mints a blank dispatch row and vice versa.
+    if (touchesDispatchRow(input)) {
+      db.prepare(
+        `INSERT INTO work_item_dispatch (work_item_id, skills, engine, model, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(work_item_id) DO UPDATE SET
+           skills = excluded.skills, engine = excluded.engine, model = excluded.model, updated_at = excluded.updated_at`,
+      ).run(id, skills.length > 0 ? JSON.stringify(skills) : null, override.engine, override.model, updatedAt);
+    }
+    if (input.autoStart !== undefined) writeAutoStartRow(db, id, autoStart, updatedAt);
+  })();
 
-  return { ok: true, config: { skills, engine: override.engine, model: override.model, updatedAt } };
+  return { ok: true, config: { skills, engine: override.engine, model: override.model, autoStart, updatedAt } };
+}
+
+function patchedAutoStart(
+  current: TodoDispatchConfig | undefined,
+  input: TodoDispatchConfigInput,
+): { ok: true; autoStart: boolean } | { ok: false; error: string } {
+  if (input.autoStart !== undefined && typeof input.autoStart !== 'boolean') {
+    return { ok: false, error: 'autoStart must be a boolean' };
+  }
+  return { ok: true, autoStart: input.autoStart ?? current?.autoStart ?? true };
+}
+
+function touchesDispatchRow(input: TodoDispatchConfigInput): boolean {
+  return input.skills !== undefined || input.engine !== undefined || input.model !== undefined;
 }
 
 export interface TodoDispatchPreamble {

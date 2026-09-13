@@ -66,8 +66,8 @@ function edge(id: string, from: string, to: string) {
   return { id, from: { nodeId: from, port: "success" as const }, to: { nodeId: to, port: "input" as const } };
 }
 function todoEvent(id: string, item: Partial<WorkflowTodoStatusEvent["item"]> = {}, actor: string | null = "operator"): WorkflowTodoStatusEvent {
-  return { id, workItemId: "ICI-1", fromStatus: "executing", toStatus: "in_review", actor, armedAsDelegate: null, quotaWindowDecided: false,
-    item: { source: "human", department: "platform", assignee: "worker", labels: [],
+  return { id, workItemId: "ICI-1", fromStatus: "executing", toStatus: "in_review", actor, actorEmployee: null, armedAsDelegate: null, quotaWindowDecided: false,
+    item: { source: "human", department: "platform", assignee: "worker", labels: [], autoStart: true,
       live: { assignee: "worker", parentId: null, status: "in_review" }, ...item } };
 }
 function todoTrigger(config: Omit<Extract<TriggerNode["config"], { kind: "todo-status" }>, "kind" | "status">): WorkflowNode {
@@ -289,6 +289,47 @@ describe("Workflow trigger adapters", () => {
     await service.recover(now);
     const run = service.listRuns(definition.id, {}).items[0]!;
     expect(repository.getRun(definition.id, run.id)!.trigger.payload).toMatchObject({ actor: "reconciler" });
+  });
+
+  it("carries the actor's employee and the Todo's auto-start opt-out into the trigger payload", async () => {
+    const definition = save("todo-gen67-payload", todoTrigger({}));
+    feed.pending.push({ ...todoEvent("event-1", { autoStart: false }, "session:6f1b0f4c-1f0f-4f0f-8f0f-0f0f0f0f0f0f"), actorEmployee: "worker" });
+    await service.recover(now);
+    const run = service.listRuns(definition.id, {}).items[0]!;
+    expect(repository.getRun(definition.id, run.id)!.trigger.payload).toMatchObject({
+      actor: "session:6f1b0f4c-1f0f-4f0f-8f0f-0f0f0f0f0f0f", actorEmployee: "worker", assignee: "worker", autoStart: false });
+  });
+
+  it("suppresses a selfAssigned: false trigger when the assignee moved the Todo themself, and fires for everyone else", async () => {
+    const definition = save("todo-not-self", todoTrigger({ selfAssigned: false }));
+    feed.pending.push({ ...todoEvent("self-claim", {}, "session:6f1b0f4c-1f0f-4f0f-8f0f-0f0f0f0f0f0f"), actorEmployee: "worker" });
+    await service.recover(now);
+    expect(service.listRuns(definition.id, {}).items).toHaveLength(0);
+    expect(feed.processed.get("self-claim")).toMatchObject([
+      { workflowId: definition.id, outcome: "suppressed", detail: expect.stringContaining("selfAssigned") },
+    ]);
+
+    // A manager's session, the operator, and a stampless legacy event all fire
+    // (one Todo each, so nothing here is superseded as a newer move on the same lane).
+    feed.pending.push({ ...todoEvent("manager-assign", {}, "session:7a2c1d5e-2a2a-4b4b-8c8c-1d1d1d1d1d1d"), actorEmployee: "manager", workItemId: "ICI-2" });
+    feed.pending.push({ ...todoEvent("operator-assign", {}, "operator"), workItemId: "ICI-3" });
+    feed.pending.push({ ...todoEvent("legacy-assign", {}, "session:8b3d2e6f-3b3b-4c4c-8d8d-2e2e2e2e2e2e"), workItemId: "ICI-4" });
+    await service.recover(now);
+    expect(service.listRuns(definition.id, {}).items).toHaveLength(3);
+  });
+
+  it("suppresses an autoStart: true trigger for a Todo that opted out, and fires for one that did not", async () => {
+    const definition = save("todo-auto-start", todoTrigger({ autoStart: true }));
+    feed.pending.push(todoEvent("opted-out", { autoStart: false }));
+    await service.recover(now);
+    expect(service.listRuns(definition.id, {}).items).toHaveLength(0);
+    expect(feed.processed.get("opted-out")).toMatchObject([
+      { workflowId: definition.id, outcome: "suppressed", detail: expect.stringContaining("autoStart") },
+    ]);
+
+    feed.pending.push(todoEvent("allowed", { autoStart: true }));
+    await service.recover(now);
+    expect(service.listRuns(definition.id, {}).items).toHaveLength(1);
   });
 
   it("carries the Todo labels into the trigger payload as an array and an interpolatable scalar", async () => {

@@ -66,6 +66,13 @@ Create a Todo only for durable work that needs an owner or review trail:
 
 Do not invent provenance or attach approval fields during creation. Each owning company surface records its own source provenance.
 
+### Auto-start and the Todo you will work yourself
+
+An instance may run a `todo-status` Workflow that starts the assignee's session whenever a Todo becomes `assigned`. Two facts let that Workflow avoid a second session on a Todo that already has one:
+
+- Every assignment event records `actorEmployee`, the employee behind the session that made the move. A Workflow trigger with `"selfAssigned": false` does not fire when that employee is the assignee — so creating a Todo and calling `assign_work_item` on yourself from the session that will do the work starts nothing extra.
+- A Todo can opt out explicitly: pass `"autoStart": false` to `create_work_item`, or later to `set_work_item_dispatch`. A trigger with `"autoStart": true` skips it. Set it when you create a Todo you will work from this session, or one that should wait for a hand-over by message. `get_work_item` shows the flag under `dispatchConfig`; `set_work_item_dispatch { autoStart: true }` restores the default.
+
 ## Approval flow
 
 Approvals are routed records on a Todo, separate from its lifecycle status. Generic `update_work_item` does not perform approval decisions or review-bounce accounting; never use it as a substitute while an approval is pending.

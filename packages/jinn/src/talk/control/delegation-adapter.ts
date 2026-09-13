@@ -67,7 +67,7 @@ export function claimTalkDelegation(input: TalkDelegationInput): ClaimedDelegati
       input.employee.name,
       input.employee.department,
       "operator",
-      "talk",
+      { origin: "talk" },
     );
     if (!assigned) throw new Error(`Todo ${input.todoId} not found`);
     const session = existing ?? createSession({

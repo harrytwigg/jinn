@@ -55,6 +55,7 @@ function dispatchConfigTool(): JinnMcpTool {
         skills: { type: "array", items: { type: "string" }, maxItems: TODO_SKILLS_MAX },
         engine: { type: ["string", "null"] },
         model: { type: ["string", "null"] },
+        autoStart: { type: "boolean" },
       },
       required: ["id"],
     },
@@ -67,8 +68,12 @@ function dispatchConfigTool(): JinnMcpTool {
         if (args[key] === null) payload[key] = null;
         else if (args[key] !== undefined) payload[key] = requireString(args, key);
       }
+      if (args.autoStart !== undefined) {
+        if (typeof args.autoStart !== "boolean") throw new JinnMcpToolError("autoStart must be a boolean");
+        payload.autoStart = args.autoStart;
+      }
       if (Object.keys(payload).length === 0) {
-        throw new JinnMcpToolError("pass at least one of skills, engine or model — an empty call would change nothing");
+        throw new JinnMcpToolError("pass at least one of skills, engine, model or autoStart — an empty call would change nothing");
       }
       const { status, body } = await gatewayRequest(ctx, "PUT", `/api/work-items/${encodeURIComponent(id)}/dispatch-config`, payload);
       if (status >= 400) throw gatewayFailure(`setting dispatch config on work item "${id}"`, status, body);

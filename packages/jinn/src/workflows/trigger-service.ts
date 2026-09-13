@@ -45,7 +45,7 @@ function refused(reason: string): TodoMismatch { return { filter: "other", reaso
  *  run always says which filter refused it. */
 function todoMismatch(node: TriggerNode, event: WorkflowTodoStatusEvent): TodoMismatch | undefined {
   if (node.config.kind !== "todo-status") return refused("trigger is not a todo-status trigger");
-  const { actor, label, department, assignee, delegates, unlabeled, unassigned, rootOnly } = node.config;
+  const { actor, label, department, assignee, delegates, unlabeled, unassigned, rootOnly, selfAssigned, autoStart } = node.config;
   // An arming delegate moved the Todo as itself, so the event names its session
   // rather than the operator; the stamp the status route wrote at that moment is
   // what says the operator's authority stands behind it. Only an `operator`
@@ -57,6 +57,13 @@ function todoMismatch(node: TriggerNode, event: WorkflowTodoStatusEvent): TodoMi
   }
   if (department !== undefined && department !== event.item.department) return refused(`department filter ${department} does not match`);
   if (assignee !== undefined && assignee !== event.item.assignee) return refused(`assignee filter ${assignee} does not match`);
+  // Both compare against the assignee the move itself recorded: the session
+  // that self-assigned is the one already working the Todo, and a later
+  // reassignment does not change who performed this event.
+  if (selfAssigned === false && event.actorEmployee !== null && event.actorEmployee === event.item.assignee) {
+    return refused(`selfAssigned filter does not match: ${event.actorEmployee} assigned the Todo to themself`);
+  }
+  if (autoStart && !event.item.autoStart) return refused("autoStart filter does not match: the Todo opted out of auto-start");
   const live = event.item.live;
   if (unlabeled !== undefined || unassigned !== undefined || rootOnly !== undefined) {
     // These three assert what the Todo IS right now, so a row that has since been
@@ -211,8 +218,8 @@ export class WorkflowTriggerService {
       for (const item of runnable) {
         const run = await this.start(item.definition, item.trigger, event.id, {
           todoId: event.workItemId, fromStatus: event.fromStatus, toStatus: event.toStatus,
-          actor: event.actor, source: event.item.source, department: event.item.department,
-          assignee: event.item.assignee, labels, labelList: labels.join(", "),
+          actor: event.actor, actorEmployee: event.actorEmployee, source: event.item.source, department: event.item.department,
+          assignee: event.item.assignee, autoStart: event.item.autoStart, labels, labelList: labels.join(", "),
         }, `todo:${event.id}`, event.workItemId);
         outcomes.push({ workflowId: item.definition.id, outcome: "started", runId: run.id, detail: `Todo event ${event.id} started.` });
       }

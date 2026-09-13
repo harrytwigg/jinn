@@ -221,7 +221,7 @@ import {
   type AttachmentActor,
 } from "../work-items/attachments.js";
 import { readWriteOrigin, writeDetail, WRITE_ORIGIN_HEADER } from "../work-items/origin.js";
-import { authorizeActingAsOperator, resolveArmingDelegate, workItemActor, type WorkItemCaller } from "./work-item-arming.js";
+import { authorizeActingAsOperator, resolveArmingDelegate, workItemActor, workItemActorEmployee, type WorkItemCaller } from "./work-item-arming.js";
 import { authorizeAgentWorkItemStatus, authorizeWorkItemOwnerManagerOrRoot, ownsWorkItem } from "./work-item-authority.js";
 import { fullWorkItemPayload, openWorkItemPayload, workItemPagePayload } from "./work-item-payload.js";
 import { listDepartmentsWithCounts } from "../work-items/departments.js";
@@ -252,6 +252,7 @@ import {
 } from "./todo-edit-precondition.js";
 import { createWorkItemIdempotent, WorkItemCreateIdempotencyConflictError } from "../work-items/create-idempotency.js";
 import { resolveTodoDispatch, setTodoDispatchConfig } from "../work-items/dispatch-config.js";
+import { writeAutoStartRow } from "../work-items/auto-start.js";
 import {
   ISO_DATE_OR_INSTANT,
   readCleanSearchParam,
@@ -2322,6 +2323,14 @@ export async function handleApiRequest(
         }
       }
       const labelRefs = body.labels === undefined ? undefined : (body.labels as string[]).map((entry) => entry.trim());
+      // GEN-67: the auto-start opt-out at creation, so a Todo an employee mints
+      // from a session that is already working it never has a window between
+      // create and assign in which a `todo-status` trigger could spawn a second
+      // session. Only `false` is worth storing; `true` is what absence means.
+      if (body.autoStart !== undefined && typeof body.autoStart !== "boolean") {
+        return badRequest(res, "autoStart must be a boolean");
+      }
+      const autoStartOptOut = body.autoStart === false;
       // ICI-733: a caller-supplied create key, same shape rules as the edit key.
       // Cron and connector retries create duplicate Todos without one.
       let idempotencyKey: string | undefined;
@@ -2369,13 +2378,16 @@ export async function handleApiRequest(
         const create = () => idempotencyKey
           ? createWorkItemIdempotent(input, idempotencyKey, labelRefs)
           : { item: createWorkItem(input), replayed: false };
-        const created = labelRefs === undefined
+        const created = labelRefs === undefined && !autoStartOptOut
           ? create()
           : initDb().transaction(() => {
             const result = create();
             // A replay's labels were written by the create it replays. Setting
             // them again would rewrite a set the Todo may have had edited since.
-            if (!result.replayed) labels = setWorkItemLabels(result.item.id, labelRefs, workItemActor(caller), caller.origin);
+            if (!result.replayed && labelRefs !== undefined) {
+              labels = setWorkItemLabels(result.item.id, labelRefs, workItemActor(caller), caller.origin);
+            }
+            if (!result.replayed && autoStartOptOut) writeAutoStartRow(initDb(), result.item.id, false, result.item.createdAt);
             return result;
           })();
         if (created.replayed) return json(res, { workItem: created.item, replayed: true }, 200);
@@ -2641,10 +2653,12 @@ export async function handleApiRequest(
       // Read the list per request, so adding or removing a delegate takes effect
       // on the next move rather than at the next restart.
       const armedAsDelegate = resolveArmingDelegate(caller, target, context.getConfig());
+      const actorEmployee = fields.asOperator ? undefined : workItemActorEmployee(caller);
       const detail = writeDetail({
         ...(note ? { note } : {}),
         ...(actingAsOperator ? { asOperator: actingAsOperator } : {}),
         ...(armedAsDelegate ? { armedAsDelegate } : {}),
+        ...(actorEmployee ? { actorEmployee } : {}),
       }, caller.origin);
       // The banner's asked-for-after reason (design-doc §5): a same-status
       // operator PUT with a note annotates the CURRENT exception state instead
@@ -2753,7 +2767,8 @@ export async function handleApiRequest(
         if (!authorized.ok) return json(res, { error: authorized.error }, authorized.status);
       }
       try {
-        const item = assignWorkItem(params.id, assignee, employee.department ?? null, workItemActor(caller), caller.origin);
+        const item = assignWorkItem(params.id, assignee, employee.department ?? null, workItemActor(caller),
+          { origin: caller.origin, actorEmployee: workItemActorEmployee(caller) });
         if (!item) return notFound(res);
         const activityReceiptId = persistTodoMutationActivity(req, context, item, "assigned", item.version !== current.version);
         return json(res, withActivityReceipt({ workItem: item }, activityReceiptId));
@@ -3317,10 +3332,14 @@ export async function handleApiRequest(
           return badRequest(res, `${key} must be a non-empty string or null`);
         }
       }
+      if (body.autoStart !== undefined && typeof body.autoStart !== "boolean") {
+        return badRequest(res, "autoStart must be a boolean");
+      }
       const result = setTodoDispatchConfig(params.id, {
         ...(body.skills !== undefined ? { skills: body.skills } : {}),
         ...(body.engine !== undefined ? { engine: body.engine === null ? null : (body.engine as string).trim() } : {}),
         ...(body.model !== undefined ? { model: body.model === null ? null : (body.model as string).trim() } : {}),
+        ...(body.autoStart !== undefined ? { autoStart: body.autoStart as boolean } : {}),
       }, context.getConfig());
       if (!result.ok) return badRequest(res, result.error);
       emitTodoProjectionEvent(context, params.id, "dispatch-config-updated");
@@ -3833,12 +3852,14 @@ export async function handleApiRequest(
         }, 502);
       }
       // The assignment no-ops when the Todo already carries this assignee, so the link is the only record that a caller delegated at all.
-      const delegationActor = workItemActor(delegationCaller.kind === "session"
+      const delegationWorkItemCaller: WorkItemCaller = delegationCaller.kind === "session"
         ? { kind: "session", callerId: delegationCaller.callerId, session: getSession(delegationCaller.callerId)! }
-        : { kind: "operator" });
+        : { kind: "operator" };
+      const delegationActor = workItemActor(delegationWorkItemCaller);
       if (requestedWorkItemId && employeeName) {
         try {
-          workItem = assignWorkItem(workItem.id, employeeName, delegateEmployee?.department ?? null, delegationActor) ?? workItem;
+          workItem = assignWorkItem(workItem.id, employeeName, delegateEmployee?.department ?? null, delegationActor,
+            { actorEmployee: workItemActorEmployee(delegationWorkItemCaller) }) ?? workItem;
         } catch (assignmentErr) {
           claim.release();
           return json(res, { error: assignmentErr instanceof Error ? assignmentErr.message : String(assignmentErr) }, 409);

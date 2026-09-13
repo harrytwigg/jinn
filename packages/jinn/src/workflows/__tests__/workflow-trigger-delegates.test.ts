@@ -54,9 +54,9 @@ let service: WorkflowService;
 let now: string;
 
 function todoEvent(id: string, actor: string, armedAsDelegate: string | null): WorkflowTodoStatusEvent {
-  return { id, workItemId: "ICI-1", fromStatus: "backlog", toStatus: "assigned", actor, armedAsDelegate,
+  return { id, workItemId: "ICI-1", fromStatus: "backlog", toStatus: "assigned", actor, actorEmployee: null, armedAsDelegate,
     quotaWindowDecided: false,
-    item: { source: "human", department: "platform", assignee: "worker", labels: [],
+    item: { source: "human", department: "platform", assignee: "worker", labels: [], autoStart: true,
       live: { assignee: "worker", parentId: null, status: "assigned" } } };
 }
 function save(id: string, config: Omit<Extract<TriggerNode["config"], { kind: "todo-status" }>, "kind" | "status">): WorkflowDefinition {

@@ -11,17 +11,26 @@ type Store = typeof import("../store.js");
 type Labels = typeof import("../labels.js");
 type Transitions = typeof import("../transitions.js");
 type Feed = typeof import("../workflow-event-feed.js");
+type Assignment = typeof import("../assignment.js");
+type AutoStart = typeof import("../auto-start.js");
+type Db = typeof import("../../shared/db.js");
 
 let store: Store;
 let labels: Labels;
 let tr: Transitions;
 let feed: Feed;
+let assign: Assignment;
+let autoStart: AutoStart;
+let db: Db;
 
 beforeAll(async () => {
   store = await import("../store.js");
   labels = await import("../labels.js");
   tr = await import("../transitions.js");
   feed = await import("../workflow-event-feed.js");
+  assign = await import("../assignment.js");
+  autoStart = await import("../auto-start.js");
+  db = await import("../../shared/db.js");
 });
 
 describe("workflow Todo event feed", () => {
@@ -67,6 +76,36 @@ describe("workflow Todo event feed", () => {
     expect(event(stamped.id)).toMatchObject({ actor: "session:delegate", armedAsDelegate: "worker" });
     expect(event(plain.id).armedAsDelegate).toBeNull();
     expect(event(malformed.id).armedAsDelegate).toBeNull();
+  });
+
+  it("carries the actor's employee from the assignment stamp, and null for a legacy or operator move", () => {
+    const stamped = store.createWorkItem({ title: "self-claimed", status: "backlog" });
+    assign.assignWorkItem(stamped.id, "worker", null, "session:worker-session", { actorEmployee: "worker" });
+    const legacy = store.createWorkItem({ title: "legacy assign", status: "backlog" });
+    assign.assignWorkItem(legacy.id, "worker", null, "session:worker-session");
+    const byOperator = store.createWorkItem({ title: "operator assign", status: "backlog" });
+    tr.transition(byOperator.id, "assigned", "operator");
+
+    const pending = feed.createWorkflowTodoEventFeed({ ownerId: "test-owner" }).listPendingEvents();
+    const event = (id: string) => pending.find((candidate) => candidate.workItemId === id)!;
+
+    expect(event(stamped.id)).toMatchObject({ actor: "session:worker-session", actorEmployee: "worker", item: { assignee: "worker" } });
+    expect(event(legacy.id).actorEmployee).toBeNull();
+    expect(event(byOperator.id).actorEmployee).toBeNull();
+  });
+
+  it("reads the Todo's auto-start opt-out live, and a Todo without one as allowed", () => {
+    const optedOut = store.createWorkItem({ title: "no auto-start", status: "backlog" });
+    autoStart.writeAutoStartRow(db.initDb(), optedOut.id, false, new Date().toISOString());
+    const plain = store.createWorkItem({ title: "auto-start", status: "backlog" });
+    tr.transition(optedOut.id, "assigned", "operator");
+    tr.transition(plain.id, "assigned", "operator");
+
+    const pending = feed.createWorkflowTodoEventFeed({ ownerId: "test-owner" }).listPendingEvents();
+    const event = (id: string) => pending.find((candidate) => candidate.workItemId === id)!;
+
+    expect(event(optedOut.id).item.autoStart).toBe(false);
+    expect(event(plain.id).item.autoStart).toBe(true);
   });
 
   it("reads an unlabelled Todo as an empty label set", () => {

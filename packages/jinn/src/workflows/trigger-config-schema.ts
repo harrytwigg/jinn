@@ -41,6 +41,15 @@ export const triggerConfigSchema = z.discriminatedUnion('kind', [
     unlabeled: z.literal(true).optional(),
     unassigned: z.literal(true).optional(),
     rootOnly: z.literal(true).optional(),
+    /** GEN-67: the two filters an auto-start binding needs so it does not spawn
+     *  a second session on a Todo that already has one. `selfAssigned: false`
+     *  refuses a move performed by the employee the Todo is assigned to — an
+     *  employee creating and claiming a Todo from a session that is already
+     *  working it. `autoStart: true` refuses a Todo whose dispatch config has
+     *  `autoStart: false`, the explicit per-Todo opt-out. Both read as "set and
+     *  restricting"; the other literal would be a filter that matches everything. */
+    selfAssigned: z.literal(false).optional(),
+    autoStart: z.literal(true).optional(),
   }),
   z.strictObject({ kind: z.literal('workflow-call') }),
 ]);
