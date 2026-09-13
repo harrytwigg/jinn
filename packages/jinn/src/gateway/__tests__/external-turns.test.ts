@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
@@ -481,5 +481,149 @@ describe("syncExternalTurn", () => {
       ["user", "continue"],
       ["assistant", "new answer"],
     ]);
+  });
+});
+
+describe("syncExternalTurn — waking the parent (GEN-66)", () => {
+  // The production shape: a delegated child whose gateway turn settled (settle
+  // callback sent), whose PTY then kept producing Stops because Claude Code
+  // re-invoked the model each time a background subagent finished. Those Stops
+  // are unclaimed and land here. The session ran on a remote build host, so the
+  // gateway cannot read its transcript — the hook-payload fallback is the path
+  // that lost senior-developer-qa's final report on 2026-09-13.
+  let events: Array<{ event: string; payload: unknown }>;
+  const emit = (event: string, payload: unknown) => events.push({ event, payload });
+  const originalFetch = globalThis.fetch;
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    events = [];
+    fetchSpy = vi.fn().mockResolvedValue({ ok: true });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /** A settled child of `parent` with a live attempt token, as settleTurn leaves it. */
+  function makeSettledChild(parentId: string, employee = "senior-developer-qa"): string {
+    const child = reg.createSession({
+      engine: "claude",
+      source: "web",
+      sourceRef: `web:child-${++seq}`,
+      prompt: "review this",
+      parentSessionId: parentId,
+      employee,
+    });
+    reg.beginSessionAttempt(child.id);
+    const token = reg.getSession(child.id)!.attemptToken!;
+    reg.completeSessionAttempt(child.id, token, { status: "idle", attemptOutcome: "succeeded" });
+    return child.id;
+  }
+
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 30));
+
+  it("wakes the parent from the hook-payload fallback path, once per distinct reply", async () => {
+    const parentId = makeSession();
+    const childId = makeSettledChild(parentId);
+    const stop = (text: string) => ({
+      hook_event_name: "Stop",
+      transcript_path: path.join(tmp, "on-the-remote-host.jsonl"),
+      last_assistant_message: text,
+    });
+
+    expect(ext.syncExternalTurn(childId, emit, stop("Adversarial reviewer still running; I'll merge and report when it lands."))).toBe(1);
+    await flush();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // Redelivered Stop: nothing persisted, nobody woken.
+    expect(ext.syncExternalTurn(childId, emit, stop("Adversarial reviewer still running; I'll merge and report when it lands."))).toBe(0);
+    await flush();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // The final report.
+    expect(ext.syncExternalTurn(childId, emit, stop("# GEN-64 round 5: Changes required\n\nP1 …"))).toBe(1);
+    await flush();
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const calls = fetchSpy.mock.calls.map(([url, opts]) => ({ url, body: JSON.parse(opts.body) }));
+    expect(calls.every((c) => c.url.endsWith(`/api/sessions/${parentId}/message`))).toBe(true);
+    expect(calls.every((c) => c.body.role === "notification")).toBe(true);
+    expect(calls[0].body.message).toContain("Adversarial reviewer still running");
+    expect(calls[1].body.message).toContain("# GEN-64 round 5: Changes required");
+    expect(calls[1].body.displayMessage).toMatch(/^📩 senior-developer-qa replied\n/);
+    expect(calls[1].body.meta).toMatchObject({ kind: "child-reply", employee: "senior-developer-qa", childSessionId: childId });
+
+    // Each wake has its own durable receipt, distinct from the settle callback's identity.
+    const deliveries = reg.listPendingSessionDeliveries().concat(
+      calls.map((c) => reg.getSessionDelivery(c.body.callbackDeliveryId)!),
+    );
+    const attempts = new Set(deliveries.map((d) => d.sourceAttempt));
+    expect(attempts.size).toBe(2);
+    const token = reg.getSession(childId)!.attemptToken!;
+    for (const attempt of attempts) expect(attempt.startsWith(`${token}:external:`)).toBe(true);
+    expect(deliveries.every((d) => d.deliveryKind === "parent-external-turn")).toBe(true);
+  });
+
+  it("wakes the parent from the transcript path with the newest assistant entry, and not for reconciled gateway turns", async () => {
+    const parentId = makeSession();
+    const childId = makeSettledChild(parentId);
+    reg.updateSession(childId, { engineSessionId: "eng-child" });
+    // What run() persisted at settle.
+    reg.insertMessage(childId, "user", "review this");
+    reg.insertMessage(childId, "assistant", "Own findings are drafted; persona reviewers still running.");
+    const settledAt = Date.now();
+
+    // The continuation: Claude Code's task notification (control text — skipped)
+    // and the model's reply.
+    const file = writeTranscript([
+      { type: "user", text: "review this", ts: new Date(settledAt - 60_000).toISOString() },
+      { type: "assistant", text: "Own findings are drafted; persona reviewers still running.", ts: new Date(settledAt - 50_000).toISOString() },
+      { type: "user", text: "<task-notification>agent done</task-notification>", ts: new Date(settledAt + 1_000).toISOString(), originKind: "task-notification" },
+      { type: "assistant", text: "Merged. Verdict: pass.", ts: new Date(settledAt + 2_000).toISOString() },
+    ]);
+    const n = ext.syncExternalTurn(childId, emit, { hook_event_name: "Stop", session_id: "eng-child", transcript_path: file, last_assistant_message: "Merged. Verdict: pass." });
+    expect(n).toBe(1);
+    await flush();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetchSpy.mock.calls[0][1].body).message).toContain("Merged. Verdict: pass.");
+
+    // Same Stop again: anchor dedup, no second wake.
+    expect(ext.syncExternalTurn(childId, emit, { hook_event_name: "Stop", session_id: "eng-child", transcript_path: file, last_assistant_message: "Merged. Verdict: pass." })).toBe(0);
+    await flush();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not wake anyone for a session without a parent, nor when the employee has alwaysNotify: false", async () => {
+    const orphan = makeSession({ engineSessionId: "no-such-claude-session" });
+    expect(ext.syncExternalTurn(orphan, emit, { hook_event_name: "Stop", transcript_path: path.join(tmp, "missing.jsonl"), last_assistant_message: "typed in the terminal" })).toBe(1);
+
+    const parentId = makeSession();
+    const quiet = makeSettledChild(parentId, "quiet-worker");
+    expect(ext.syncExternalTurn(quiet, emit, { hook_event_name: "Stop", transcript_path: path.join(tmp, "missing.jsonl"), last_assistant_message: "quiet reply" }, {
+      resolveEmployee: (slug) => (slug === "quiet-worker" ? { id: slug, name: slug, alwaysNotify: false } as any : undefined),
+    })).toBe(1);
+
+    await flush();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(reg.getMessages(orphan)).toHaveLength(1);
+    expect(reg.getMessages(quiet)).toHaveLength(1);
+  });
+
+  it("an explicit send_to_session relay suppresses exactly one later wake", async () => {
+    const parentId = makeSession();
+    const childId = makeSettledChild(parentId);
+    const token = reg.getSession(childId)!.attemptToken!;
+    reg.recordChildReportedToParent(childId, token);
+    const stop = (text: string) => ({ hook_event_name: "Stop", transcript_path: path.join(tmp, "missing.jsonl"), last_assistant_message: text });
+
+    expect(ext.syncExternalTurn(childId, emit, stop("Findings sent to senior-developer."))).toBe(1);
+    await flush();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect((reg.getSession(childId)!.transportMeta as any)?.reportedToParentAttempt).toBeUndefined();
+
+    expect(ext.syncExternalTurn(childId, emit, stop("Post-pass commit verified; pass stands."))).toBe(1);
+    await flush();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });

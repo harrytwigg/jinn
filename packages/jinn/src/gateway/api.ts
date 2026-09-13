@@ -1915,7 +1915,9 @@ export async function handleApiRequest(
         // Stop was missed entirely: fire-and-forget a transcript tail sync.
         // Cheap (one stat() in the common case) and never delays this GET —
         // the frontend refetches on `session:external-turn`.
-        scheduleOnLoadTailSync(params.id, context.emit);
+        scheduleOnLoadTailSync(params.id, context.emit, {
+          resolveEmployee: (slug) => orgRegistry(context.getConfig()).get(slug),
+        });
       }
 
       return json(res, {

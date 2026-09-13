@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import { logger } from "../shared/logger.js";
 import { getSession, getMessages, insertMessage, updateMessageContent, updateSession, type SessionMessage } from "../sessions/registry.js";
+import { notifyParentOfExternalTurn } from "../sessions/callbacks.js";
 import { initDb } from "../shared/db.js";
 import { findTranscriptForSession } from "../engines/claude-interactive.js";
 import type { HookPayload } from "./hook-registry.js";
 import type { GatewayEmit } from "../shared/gateway-events.js";
+import type { Employee, Session } from "../shared/types.js";
 
 /**
  * External-turn sync: persist turns that happened OUTSIDE a gateway run() —
@@ -283,6 +285,29 @@ function upgradeTruncatedRows(persisted: SessionMessage[], entries: TranscriptTa
   });
 }
 
+export interface SyncExternalTurnOptions {
+  /** Employee lookup for the parent wake's `alwaysNotify` (the same switch the
+   *  settle callback honours). Absent, or returning undefined, means notify. */
+  resolveEmployee?: (slug: string) => Employee | undefined;
+}
+
+/**
+ * A child session's reply that run() never saw is still a reply its parent is
+ * waiting for. Wake the parent the way settleTurn would have, keyed on the sync
+ * anchor so a redelivered Stop cannot wake it twice. Fire-and-forget: the sync
+ * has already persisted the turn, and the callback module owns retry.
+ */
+function wakeParentForExternalReply(
+  session: Session,
+  newest: { role: "user" | "assistant"; content: string } | undefined,
+  turnKey: string,
+  options?: SyncExternalTurnOptions,
+): void {
+  if (!session.parentSessionId || newest?.role !== "assistant") return;
+  const employee = session.employee ? options?.resolveEmployee?.(session.employee) : undefined;
+  void notifyParentOfExternalTurn(session, newest.content, turnKey, { alwaysNotify: employee?.alwaysNotify });
+}
+
 /**
  * Persist any un-synced transcript tail for a session into the messages DB.
  * Primary trigger: an unclaimed Stop hook (PTY-native turn — no run() in
@@ -290,12 +315,18 @@ function upgradeTruncatedRows(persisted: SessionMessage[], entries: TranscriptTa
  *
  * Returns the number of messages inserted. Emits `session:external-turn`
  * `{ sessionId }` when anything was persisted (the frontend refetches messages
- * on it).
+ * on it). When the newest persisted message is an assistant reply and the
+ * session has a parent, the parent is woken exactly as it would have been had
+ * the reply settled a gateway turn — Claude Code re-invokes the model after a
+ * background subagent finishes, and that continuation's Stop lands here, not in
+ * settleTurn; before this the child's final report was persisted to its own
+ * chat and the parent slept through it (GEN-66).
  */
 export function syncExternalTurn(
   sessionId: string,
   emit: GatewayEmit,
   payload?: HookPayload,
+  options?: SyncExternalTurnOptions,
 ): number {
   const session = getSession(sessionId);
   if (!session) {
@@ -332,11 +363,13 @@ export function syncExternalTurn(
     const newest = existing[existing.length - 1];
     if (newest && newest.role === "assistant" && newest.content === hookText) return 0;
     insertMessage(sessionId, "assistant", hookText);
-    setAnchor(sessionId, new Date().toISOString());
+    const anchorIso = new Date().toISOString();
+    setAnchor(sessionId, anchorIso);
     emit("session:external-turn", { sessionId });
     logger.info(
       `External turn persisted for session ${sessionId} from hook payload (transcript unreadable: ${transcriptPath ?? "not found"})`,
     );
+    wakeParentForExternalReply(session, { role: "assistant", content: hookText }, anchorIso, options);
     return 1;
   }
   if (entries.length === 0) return 0; // tail already synced — dedup no-op
@@ -399,6 +432,7 @@ export function syncExternalTurn(
     `Synced ${fresh.length} external (CLI-native) message(s) for session ${sessionId} (anchor → ${tailAnchorIso}` +
       `${alreadyPersisted.length > 0 ? `, ${alreadyPersisted.length} already-persisted message(s) reconciled in place` : ""})`,
   );
+  wakeParentForExternalReply(session, fresh[fresh.length - 1], tailAnchorIso, options);
   return fresh.length;
 }
 
@@ -415,6 +449,7 @@ const onLoadSyncInProgress = new Set<string>();
 export function scheduleOnLoadTailSync(
   sessionId: string,
   emit: GatewayEmit,
+  options?: SyncExternalTurnOptions,
 ): void {
   if (onLoadSyncInProgress.has(sessionId)) return;
   onLoadSyncInProgress.add(sessionId);
@@ -431,7 +466,7 @@ export function scheduleOnLoadTailSync(
       } catch {
         return;
       }
-      syncExternalTurn(sessionId, emit);
+      syncExternalTurn(sessionId, emit, undefined, options);
     } catch (err) {
       logger.warn(`On-load transcript tail sync failed for session ${sessionId}: ${err instanceof Error ? err.message : err}`);
     } finally {
