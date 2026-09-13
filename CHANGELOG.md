@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### 🐛 Fixes
-- **A child session's later replies wake its parent.** When a delegated child's Claude Code session kept working after its turn settled — a background subagent finished and the model was re-invoked — every reply after the first was persisted to the child's chat but never delivered to the parent, which sat idle until someone nudged it by hand. Those unclaimed Stops now wake the parent exactly like a settled turn, with a durable receipt per reply. An explicit `send_to_session` report suppresses only the callback for the turn that made it, not every later reply of the same attempt.
+- **A child session's later replies wake its parent.** When a delegated child's Claude Code session kept working after its turn settled — a background subagent finished and the model was re-invoked — every reply after the first was persisted to the child's chat but never delivered to the parent, which sat idle until someone nudged it by hand. Those unclaimed Stops now wake the parent exactly like a settled turn, with a durable receipt per synced reply. An explicit `send_to_session` report suppresses only the callback for the turn that made it, not every later reply of the same attempt.
 
 ### ✨ Features
 - **Todos can opt out of being auto-started on assignment.** Assignment events now record `actorEmployee`, the employee behind the session that made the move, and a Todo's dispatch config carries `autoStart` (settable at `create_work_item` and through `set_work_item_dispatch`). `todo-status` triggers gain `selfAssigned: false` and `autoStart: true` filters, and their payload exposes both facts, so an auto-start Workflow no longer spawns a second session for a Todo an employee created and claimed from the session already working it.

@@ -920,6 +920,32 @@ describe("notifyParentOfExternalTurn", () => {
     expect(fetchSpy).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    ["an empty settle", { result: "" }],
+    ["a failed settle", { error: "engine error after the relay" }],
+  ])("consumes the relay marker at %s so the next external reply still fires (QA F1)", async (_label, settle) => {
+    // The child relayed with send_to_session, then its gateway turn settled
+    // without a sendable success reply while the CLI kept working. The marker
+    // must not survive that settle to swallow the real report that follows.
+    let marker: string | undefined = "attempt-001";
+    vi.mocked(getSession).mockImplementation((id: string) =>
+      id === "child-001"
+        ? makeSession({ transportMeta: marker ? { reportedToParentAttempt: marker } : null })
+        : makeSession({ id: "parent-001", parentSessionId: null, status: "idle" }),
+    );
+    vi.mocked(consumeChildReportedToParent).mockImplementation(() => { marker = undefined; return true; });
+
+    notifyParentSession(makeSession(), settle);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(consumeChildReportedToParent).toHaveBeenCalledWith("child-001", "attempt-001");
+    // An error always surfaces; an empty success sends nothing.
+    expect(fetchSpy).toHaveBeenCalledTimes("error" in settle ? 1 : 0);
+
+    await notifyParentOfExternalTurn(makeSession(), "# Findings\n\nP1 …", "k1");
+    expect(fetchSpy).toHaveBeenCalledTimes("error" in settle ? 2 : 1);
+    expect(JSON.parse(fetchSpy.mock.calls.at(-1)![1].body).message).toContain("# Findings");
+  });
+
   it("does not apply the delegation completion contract to an external reply", async () => {
     // A progress-only reply from a Todo child at SETTLE earns one nudge; the
     // same words in a post-settle continuation are a follow-up, not a second

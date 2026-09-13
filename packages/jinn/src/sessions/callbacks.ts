@@ -104,11 +104,14 @@ export async function notifyParentSessionAndWait(
   result: { result?: string | null; error?: string | null; cost?: number; durationMs?: number },
   options?: { alwaysNotify?: boolean },
 ): Promise<void> {
-  if (!result.error && !hasMeaningfulReply(result.result)) return;
-
   if (!childSession.parentSessionId) return;
 
-  if (!result.error && suppressedByExplicitRelay(childSession)) return;
+  // The marker is consumed by the settle that matches it whether or not a
+  // callback goes out: a relay followed by an empty or failed settle (engine
+  // error, settleThrownTurn) must not leave it standing to swallow the next
+  // external reply — that would re-create the GEN-66 loss on a side path.
+  const relayed = consumeExplicitRelay(childSession);
+  if (!result.error && (!hasMeaningfulReply(result.result) || relayed)) return;
 
   await _sendNotification(childSession, result, options).catch((err) => {
     logger.warn(`[callbacks] Failed to notify parent session ${childSession.parentSessionId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -138,8 +141,8 @@ export async function notifyParentOfExternalTurn(
   options?: { alwaysNotify?: boolean },
 ): Promise<void> {
   if (!childSession.parentSessionId) return;
-  if (!hasMeaningfulReply(text)) return;
-  if (suppressedByExplicitRelay(childSession)) return;
+  const relayed = consumeExplicitRelay(childSession);
+  if (!hasMeaningfulReply(text) || relayed) return;
 
   await _sendNotification(childSession, { result: text }, {
     alwaysNotify: options?.alwaysNotify,
@@ -155,15 +158,15 @@ export async function notifyParentOfExternalTurn(
  * Cross-channel de-duplication: if the child already reported UP to this parent
  * via send_to_session during the model turn that is now settling, that explicit
  * relay and this automatic callback are two injections of the SAME turn — the
- * operator sees the second as a spurious "duplicate callback" wake. Suppress it,
- * and consume the marker so it suppresses exactly one callback: a later reply in
- * the same attempt (an external turn after a background subagent) is new
- * information, not a duplicate. A re-read sees the marker written mid-turn; a
- * NEW attempt mints a token that no longer matches, so a stale marker never
- * outlives its turn. Errors always surface (the explicit report may predate the
- * failure) — callers skip this check for them.
+ * operator sees the second as a spurious "duplicate callback" wake. Returns true
+ * when the marker matched, and consumes it either way so it suppresses at most
+ * one callback: a later reply in the same attempt (an external turn after a
+ * background subagent) is new information, not a duplicate. A re-read sees the
+ * marker written mid-turn; a NEW attempt mints a token that no longer matches,
+ * so a stale marker never outlives its turn. Errors always surface (the explicit
+ * report may predate the failure) — callers consume but do not suppress on them.
  */
-function suppressedByExplicitRelay(childSession: Session): boolean {
+function consumeExplicitRelay(childSession: Session): boolean {
   const fresh = getSession(childSession.id) ?? childSession;
   if (!fresh.attemptToken || fresh.transportMeta?.reportedToParentAttempt !== fresh.attemptToken) return false;
   consumeChildReportedToParent(fresh.id, fresh.attemptToken);
