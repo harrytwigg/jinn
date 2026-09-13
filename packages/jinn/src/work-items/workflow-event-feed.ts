@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { initDb } from '../shared/db.js';
 import { getWorkItem, type WorkItemSource, type WorkItemStatus } from './store.js';
 import { getWorkItemLabels } from './labels.js';
+import { todoAutoStartAllowed } from './auto-start.js';
 import { isTodoId } from './id.js';
 
 export interface WorkflowTodoStatusEvent {
@@ -13,6 +14,12 @@ export interface WorkflowTodoStatusEvent {
    *  column rather than the provenance snapshot — so every event written
    *  before the trigger filter existed replays with its actor intact. */
   actor: string | null;
+  /** The employee behind a `session:` actor, stamped at the moment of the move
+   *  from the session's own identity — never from the request — so a trigger
+   *  can tell "the assignee moved this themself" from "someone handed it to
+   *  them". Null for the operator, derived movers, employee-less sessions, and
+   *  every event written before the stamp existed (GEN-67). */
+  actorEmployee: string | null;
   /** The employee the status route stamped this move as armed on behalf of, or
    *  null for every other event. It is written at the moment of the move, so a
    *  later change to the delegate list never rewrites what already happened. */
@@ -33,12 +40,15 @@ export interface WorkflowTodoStatusEvent {
    *  row rather than whatever it carried when it moved. `live` is null once the
    *  row is gone, which is not the same as a Todo that is simply unassigned. Its
    *  `status` is the Todo's status NOW, which is what says whether the Todo is
-   *  still sitting where this event put it. */
+   *  still sitting where this event put it. `autoStart` is read live too: it is
+   *  the Todo's own opt-out of being auto-started (GEN-67), and a Todo that has
+   *  not opted out reads true. */
   item: {
     source: WorkItemSource;
     department: string | null;
     assignee: string | null;
     labels: Array<{ id: string; name: string }>;
+    autoStart: boolean;
     live: { assignee: string | null; parentId: string | null; status: WorkItemStatus } | null;
   };
 }
@@ -171,7 +181,8 @@ function eventFromImmutableSnapshot(row: TodoEventRow): WorkflowTodoStatusEvent 
   if (!row.detail) return null;
   try {
     const detail = JSON.parse(row.detail) as
-      { todoProvenance?: unknown; armedAsDelegate?: unknown; availabilityResume?: unknown; recoveryResume?: unknown };
+      { todoProvenance?: unknown; actorEmployee?: unknown; armedAsDelegate?: unknown; availabilityResume?: unknown;
+        recoveryResume?: unknown };
     const snapshot = detail.todoProvenance;
     if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return null;
     const value = snapshot as Record<string, unknown>;
@@ -186,6 +197,7 @@ function eventFromImmutableSnapshot(row: TodoEventRow): WorkflowTodoStatusEvent 
       fromStatus: row.from_status,
       toStatus: row.to_status,
       actor: row.actor,
+      actorEmployee: typeof detail.actorEmployee === 'string' ? detail.actorEmployee : null,
       armedAsDelegate: typeof detail.armedAsDelegate === 'string' ? detail.armedAsDelegate : null,
       quotaWindowDecided: detail.availabilityResume === true,
       ...(detail.recoveryResume === true ? { armedAsRecovery: true } : {}),
@@ -194,6 +206,7 @@ function eventFromImmutableSnapshot(row: TodoEventRow): WorkflowTodoStatusEvent 
         department: value.department as string | null,
         assignee: value.assignee as string | null,
         labels: getWorkItemLabels(row.work_item_id).map(({ id, name }) => ({ id, name })),
+        autoStart: todoAutoStartAllowed(initDb(), row.work_item_id),
         live: current ? { assignee: current.assignee, parentId: current.parentId, status: current.status } : null,
       },
     };

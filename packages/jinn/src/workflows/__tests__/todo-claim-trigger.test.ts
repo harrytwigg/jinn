@@ -58,9 +58,9 @@ let pending: WorkflowTodoStatusEvent[] = [];
 
 function event(id: string, workItemId: string): WorkflowTodoStatusEvent {
   return {
-    id, workItemId, fromStatus: "executing", toStatus: "in_review", actor: "operator", armedAsDelegate: null,
+    id, workItemId, fromStatus: "executing", toStatus: "in_review", actor: "operator", actorEmployee: null, armedAsDelegate: null,
     quotaWindowDecided: false,
-    item: { source: "human", department: null, assignee: null, labels: [],
+    item: { source: "human", department: null, assignee: null, labels: [], autoStart: true,
       live: { assignee: null, parentId: null, status: "in_review" } },
   };
 }

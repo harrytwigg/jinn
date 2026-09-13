@@ -17,6 +17,19 @@ export function workItemActor(caller: WorkItemCaller): string {
 }
 
 /**
+ * The employee behind the actor, or undefined when there is none: the operator,
+ * or a session that carries no employee. Stamped into the transition's detail
+ * as `actorEmployee` (GEN-67) so a `todo-status` trigger can tell a Todo the
+ * assignee claimed themself from one somebody handed to them — the actor string
+ * alone names a session id, which the filter cannot compare to an assignee. Like
+ * the arming-delegate stamp, it is read from the session's own identity rather
+ * than the request, so it is a fact the gateway asserts.
+ */
+export function workItemActorEmployee(caller: WorkItemCaller): string | undefined {
+  return caller.kind === 'session' ? caller.session.employee ?? undefined : undefined;
+}
+
+/**
  * `asOperator` stamps the transition's recorded actor as `operator`, so a
  * `todo-status` Workflow trigger filtered on the operator fires for work the
  * COO arms on the operator's behalf.

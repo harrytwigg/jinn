@@ -7,7 +7,7 @@ import { EXPECTED_ENUMS, EXPECTED_REQUIRED, EXPECTED_TOOL_NAMES } from "./tool-m
 // Fixed provider budget. Rebased for the experiment Todo link with the same
 // ~zero headroom discipline as before: new tool prose must stay concise rather
 // than growing into this ceiling.
-const MAX_MANIFEST_TOKENS = 6103;
+const MAX_MANIFEST_TOKENS = 6133;
 // Exact gate: js-tiktoken 1.0.21 with its local o200k_base ranks. The provider
 // projection is the OpenAI Responses API function-tool request shape pinned on 2026-07-12.
 const ATTESTED = {
@@ -196,9 +196,24 @@ const ATTESTED = {
   // above record — there is no dead prose left on this surface to buy them back
   // with, so the ceiling moves by exactly that and Pi sits ON it again. The next
   // addition to this surface has to buy its room before it spends any.
-  rpc: { tokens: 5582, sha256: "b38ac734a687cf4d8fa3e15cef177d301687b89854fbf0ba3f398ec2a3e4375d" },
-  pi: { tokens: 6103, sha256: "a039d326b6abec81fe24df4cbe3758751b54baeb3ce30f02ef8c087c295ec406" },
-  openai: { tokens: 5793, sha256: "ecb800c6904eb246eda11cd4fcbb503dba463ed7f6dc1769036562b6ae30f01e" },
+  // Rebased for `autoStart` on create_work_item and set_work_item_dispatch
+  // (GEN-67). An instance's auto-start Workflow spawns the assignee's session
+  // on backlog→assigned, so an employee that created a Todo and claimed it from
+  // the session already working it got a second session on the same Todo. The
+  // self-assign case is handled without any manifest cost (the assignment event
+  // records the actor's employee); this property is the explicit opt-out for a
+  // Todo that must wait for a hand-over. It is the cheapest shape that still
+  // says what `false` does without overstating it: one boolean on each tool,
+  // and a single clause on the create tool only — naming the todo-status
+  // trigger filter that honours it, since a Workflow without that filter does
+  // not — while the dispatch tool's boolean rides on it. That is 30 tokens,
+  // and — as every paragraph above records — there is no dead prose left on
+  // this surface to buy them back with, so the ceiling moves by exactly that
+  // and Pi sits ON it again. The next addition to this surface has to buy its
+  // room before it spends any.
+  rpc: { tokens: 5612, sha256: "a2f7e870afed166c0fadbac232e80998024b0da9cae28fa0381f185e69c09acc" },
+  pi: { tokens: 6133, sha256: "ddda5517109dcd25664347e4ac077648914e79a7f1a0abedd0927888f98eed28" },
+  openai: { tokens: 5823, sha256: "5fae3189663d9a9ed1d2e70da6896dad193c69d55b51cb4e88acc69187509739" },
 } as const;
 
 type TokenizerLoader = () => Promise<[{ Tiktoken: typeof import("js-tiktoken/lite").Tiktoken }, { default: typeof import("js-tiktoken/ranks/o200k_base").default }]>;

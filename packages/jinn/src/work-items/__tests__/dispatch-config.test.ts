@@ -160,6 +160,39 @@ describe("the engine/model override is validated when it is SET", () => {
   });
 });
 
+describe("autoStart is the Todo's opt-out of being auto-started on assignment (GEN-67)", () => {
+  it("is absent until set, reads true by default, and false once opted out", async () => {
+    const id = todo("auto-start default");
+    expect(dispatch.getTodoDispatchConfig(id)).toBeUndefined();
+
+    const set = dispatch.setTodoDispatchConfig(id, { autoStart: false }, config());
+    expect(set.ok).toBe(true);
+    expect(set.ok && set.config).toMatchObject({ skills: [], engine: null, model: null, autoStart: false });
+    expect(dispatch.getTodoDispatchConfig(id)).toMatchObject({ autoStart: false });
+    // Only the flag was set, so no dispatch row was minted for it.
+    expect(store.getWorkItem(id)).toBeDefined();
+    expect((await import("../../shared/db.js")).initDb()
+      .prepare("SELECT COUNT(*) FROM work_item_dispatch WHERE work_item_id = ?").pluck().get(id)).toBe(0);
+  });
+
+  it("survives a later engine/skills patch, and an engine patch leaves it alone", () => {
+    const id = todo("auto-start patch");
+    dispatch.setTodoDispatchConfig(id, { autoStart: false }, config());
+    const patched = dispatch.setTodoDispatchConfig(id, { skills: ["dev-workflow"], engine: "claude" }, config());
+    expect(patched.ok && patched.config).toMatchObject({ skills: ["dev-workflow"], engine: "claude", autoStart: false });
+
+    const restored = dispatch.setTodoDispatchConfig(id, { autoStart: true }, config());
+    expect(restored.ok && restored.config).toMatchObject({ skills: ["dev-workflow"], engine: "claude", autoStart: true });
+    expect(dispatch.getTodoDispatchConfig(id)).toMatchObject({ autoStart: true });
+  });
+
+  it("reads as a no-op dispatch preamble when the Todo has only opted out", () => {
+    const id = todo("auto-start only");
+    dispatch.setTodoDispatchConfig(id, { autoStart: false }, config());
+    expect(dispatch.resolveTodoDispatch(id)).toEqual({ ok: true, preamble: { prefix: "", engine: null, model: null } });
+  });
+});
+
 describe("skills are re-resolved at DISPATCH, against the workspace as it is then", () => {
   it("fails the dispatch when every requested skill has since been uninstalled, naming them", () => {
     const id = todo("dispatch all gone");

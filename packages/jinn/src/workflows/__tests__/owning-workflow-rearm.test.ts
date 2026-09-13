@@ -58,11 +58,11 @@ let pending: WorkflowTodoStatusEvent[] = [];
 function event(id: string, workItemId: string, actor = "operator", extra: Partial<WorkflowTodoStatusEvent> = {}): WorkflowTodoStatusEvent {
   const item = store.getWorkItem(workItemId);
   return {
-    id, workItemId, fromStatus: "blocked", toStatus: "assigned", actor, armedAsDelegate: null,
+    id, workItemId, fromStatus: "blocked", toStatus: "assigned", actor, actorEmployee: null, armedAsDelegate: null,
     quotaWindowDecided: false,
     item: {
       source: "session", department: "platform", assignee: item?.assignee ?? "platform-worker",
-      labels: labels.getWorkItemLabels(workItemId).map(({ id: labelId, name }) => ({ id: labelId, name })),
+      labels: labels.getWorkItemLabels(workItemId).map(({ id: labelId, name }) => ({ id: labelId, name })), autoStart: true,
       live: item ? { assignee: item.assignee, parentId: item.parentId, status: item.status } : null,
     },
     ...extra,

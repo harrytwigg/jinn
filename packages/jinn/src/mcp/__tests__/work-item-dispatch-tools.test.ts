@@ -109,6 +109,16 @@ describe("set_work_item_dispatch", () => {
 
     expect(calls[0].body).toEqual({ engine: null, model: null });
   });
+
+  it("sends autoStart on its own, and refuses a non-boolean before reaching the gateway", async () => {
+    const { calls, ctx } = stub(() => ({ status: 200, body: {} }));
+
+    await tool("set_work_item_dispatch").handler({ id: "JIN-9", autoStart: false }, ctx);
+    expect(calls[0].body).toEqual({ autoStart: false });
+
+    await expect(tool("set_work_item_dispatch").handler({ id: "JIN-9", autoStart: "no" }, ctx)).rejects.toThrow(/autoStart/);
+    expect(calls).toHaveLength(1);
+  });
 });
 
 describe("land_on_work_item", () => {

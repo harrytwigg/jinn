@@ -108,7 +108,7 @@ describe("work-item tools — registry + schemas", () => {
   it("create schema has no approval fields and update schema allows manual start but excludes cancelled", () => {
     const createProps = tool("create_work_item").inputSchema.properties;
     expect(Object.keys(createProps).sort()).toEqual(
-      ["acceptance", "body", "department", "dueAt", "idempotencyKey", "labels", "parentId", "priority", "title", "verifyPolicy"].sort(),
+      ["acceptance", "autoStart", "body", "department", "dueAt", "idempotencyKey", "labels", "parentId", "priority", "title", "verifyPolicy"].sort(),
     );
     expect(JSON.stringify(createProps)).not.toMatch(/approval/i);
     const status = tool("update_work_item").inputSchema.properties.status as { enum: string[] };

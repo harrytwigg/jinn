@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### ✨ Features
+- **Todos can opt out of being auto-started on assignment.** Assignment events now record `actorEmployee`, the employee behind the session that made the move, and a Todo's dispatch config carries `autoStart` (settable at `create_work_item` and through `set_work_item_dispatch`). `todo-status` triggers gain `selfAssigned: false` and `autoStart: true` filters, and their payload exposes both facts, so an auto-start Workflow no longer spawns a second session for a Todo an employee created and claimed from the session already working it.
+
 ## [0.33.3] - 2026-09-06
 
 ### 🐛 Fixes

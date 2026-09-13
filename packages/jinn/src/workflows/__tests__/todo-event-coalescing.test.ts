@@ -65,11 +65,11 @@ const feed: WorkflowTodoEventFeed = {
 
 function event(id: string, workItemId: string, labels: string[] = []): WorkflowTodoStatusEvent {
   return {
-    id, workItemId, fromStatus: "executing", toStatus: "in_review", actor: "operator", armedAsDelegate: null,
+    id, workItemId, fromStatus: "executing", toStatus: "in_review", actor: "operator", actorEmployee: null, armedAsDelegate: null,
     quotaWindowDecided: false,
     item: {
       source: "human", department: null, assignee: null,
-      labels: labels.map((name) => ({ id: `lbl_${name}`, name })),
+      labels: labels.map((name) => ({ id: `lbl_${name}`, name })), autoStart: true,
       live: { assignee: null, parentId: null, status: "in_review" },
     },
   };
@@ -203,8 +203,8 @@ describe("coalescing a backlog of pending Todo events", () => {
       workflowId: "build-only",
       idempotencyKey: "todo:event-2",
       payload: {
-        todoId: item.id, fromStatus: "executing", toStatus: "in_review", actor: "operator",
-        source: "human", department: null, assignee: null, labels: ["build"], labelList: "build",
+        todoId: item.id, fromStatus: "executing", toStatus: "in_review", actor: "operator", actorEmployee: null,
+        source: "human", department: null, assignee: null, autoStart: true, labels: ["build"], labelList: "build",
       },
     }]);
   });

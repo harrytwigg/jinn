@@ -316,6 +316,19 @@ describe('canonical workflow node model', () => {
       { kind: 'todo-status', status: 'assigned', unlabeled: false } as unknown as TriggerNode['config'],
     )).success).toBe(false);
   });
+
+  it('parses the auto-start filters only in their restricting form', () => {
+    const triggerConfigs: TriggerNode['config'][] = [
+      { kind: 'todo-status', status: 'assigned', selfAssigned: false },
+      { kind: 'todo-status', status: 'assigned', autoStart: true },
+    ];
+    expect(triggerConfigs.map((config) => workflowNodeSchema.parse(triggerNode(config)).config)).toEqual(triggerConfigs);
+    for (const config of [{ selfAssigned: true }, { autoStart: false }]) {
+      expect(workflowNodeSchema.safeParse(triggerNode(
+        { kind: 'todo-status', status: 'assigned', ...config } as unknown as TriggerNode['config'],
+      )).success).toBe(false);
+    }
+  });
 });
 
 describe('employee runtime boundaries', () => {

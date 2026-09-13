@@ -26,6 +26,29 @@ export const WORK_ITEM_DISPATCH_DDL = `
 ${WORK_ITEM_DISPATCH_TABLE_DDL};
 `;
 
+/** GEN-67: whether a Todo may be auto-started by a `todo-status` Workflow
+ *  trigger when it is assigned. The instance's auto-start Workflow spawns the
+ *  assignee's session on backlog→assigned; a Todo an employee creates and
+ *  self-assigns from a session that is already working it wants NO second
+ *  session, and so does one the operator intends to hand over by message.
+ *
+ *  Its own table rather than a column on `work_item_dispatch`, for the same
+ *  reason that table is not a column on `work_items`: the exact-shape verifier
+ *  refuses drift in an existing table, so an additive table is the only shape a
+ *  deployed database can grow into. A row exists only once something has been
+ *  set; absence reads as auto-start allowed. It is surfaced as `autoStart` on
+ *  the Todo's dispatch config, where the other "how this Todo runs" knobs live. */
+export const WORK_ITEM_AUTO_START_TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS work_item_auto_start (
+  work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+  auto_start   INTEGER NOT NULL CHECK (auto_start IN (0, 1)),
+  updated_at   TEXT NOT NULL
+)`;
+
+export const WORK_ITEM_AUTO_START_DDL = `
+${WORK_ITEM_AUTO_START_TABLE_DDL};
+`;
+
 /** ICI-733: one row per caller-supplied create key, so a cron or connector that
  *  retries a create gets the Todo it already made instead of a duplicate.
  *  `(source, source_ref)` already dedupes machine mints, but it is server-minted
@@ -71,6 +94,13 @@ export function workItemDispatchRowsAreSound(db: DatabaseType, hasWorkItem: (id:
     }
   }
   return true;
+}
+
+/** Data-level re-proof of the auto-start rows: every row belongs to a live Todo
+ *  (the CHECK constraint already pins the flag itself). */
+export function workItemAutoStartRowsAreSound(db: DatabaseType, hasWorkItem: (id: string) => boolean): boolean {
+  const ids = db.prepare("SELECT work_item_id FROM work_item_auto_start").pluck().all() as string[];
+  return ids.every((id) => hasWorkItem(id));
 }
 
 /**

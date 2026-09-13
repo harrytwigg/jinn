@@ -23,6 +23,8 @@ interface Assignment {
   assignee: string;
   department: string | null;
   actor?: string | null;
+  /** The employee behind a `session:` actor, when the caller knows it (GEN-67). */
+  actorEmployee?: string;
   origin?: WriteOrigin;
 }
 
@@ -31,7 +33,7 @@ interface Assignment {
 function assignmentEvent(
   item: WorkItem,
   target: WorkItemStatus,
-  { assignee, department, actor, origin }: Assignment,
+  { assignee, department, actor, actorEmployee, origin }: Assignment,
 ): AppendWorkItemEventInput {
   const moved = item.status !== target;
   return {
@@ -43,6 +45,7 @@ function assignmentEvent(
     detail: {
       assignee,
       department,
+      ...(actorEmployee ? { actorEmployee } : {}),
       ...(origin ? { origin } : {}),
       todoProvenance: todoProvenanceSnapshot({ source: item.source, department, assignee }),
     },
@@ -54,12 +57,18 @@ function assignmentEvent(
  * its only callers and carry the roster check, so backlog→assigned emits the same committed status
  * event and live todo-status listener notification as any lifecycle move. The operator pen instead
  * restores or clears the ownership fields, version-fenced, with no status move and no notification. */
+export interface AssignWorkItemOptions {
+  origin?: WriteOrigin;
+  /** The employee behind a `session:` actor, when the caller knows it (GEN-67). */
+  actorEmployee?: string;
+}
+
 export function assignWorkItem(
   id: string,
   assignee: string,
   department: string | null,
   actor?: string | null,
-  origin?: WriteOrigin,
+  { origin, actorEmployee }: AssignWorkItemOptions = {},
 ): WorkItem | undefined {
   const db = initDb();
   const txn = db.transaction((): TransitionResult | undefined => {
@@ -80,7 +89,7 @@ export function assignWorkItem(
     if (result.changes === 0) {
       throw new TransitionError('conflict', `work item ${id} changed concurrently (expected status ${item.status})`);
     }
-    const event = appendWorkItemEvent(assignmentEvent(item, target, { assignee, department, actor, origin }));
+    const event = appendWorkItemEvent(assignmentEvent(item, target, { assignee, department, actor, actorEmployee, origin }));
     return { item: getWorkItem(id)!, escalated: false, event };
   });
   const result = txn();
