@@ -7,7 +7,7 @@ import { EXPECTED_ENUMS, EXPECTED_REQUIRED, EXPECTED_TOOL_NAMES } from "./tool-m
 // Fixed provider budget. Rebased for the experiment Todo link with the same
 // ~zero headroom discipline as before: new tool prose must stay concise rather
 // than growing into this ceiling.
-const MAX_MANIFEST_TOKENS = 6132;
+const MAX_MANIFEST_TOKENS = 6133;
 // Exact gate: js-tiktoken 1.0.21 with its local o200k_base ranks. The provider
 // projection is the OpenAI Responses API function-tool request shape pinned on 2026-07-12.
 const ATTESTED = {
@@ -203,15 +203,17 @@ const ATTESTED = {
   // self-assign case is handled without any manifest cost (the assignment event
   // records the actor's employee); this property is the explicit opt-out for a
   // Todo that must wait for a hand-over. It is the cheapest shape that still
-  // says what `false` does: one boolean on each tool, and a single eight-word
-  // clause on the create tool only — the dispatch tool's boolean rides on it.
-  // That is 29 tokens, and — as every paragraph above records — there is no
-  // dead prose left on this surface to buy them back with, so the ceiling moves
-  // by exactly that and Pi sits ON it again. The next addition to this surface
-  // has to buy its room before it spends any.
-  rpc: { tokens: 5611, sha256: "032be88e7f2dad04270bc8ee4b6ed59e62e84bea984f3708cfdf5dd3c20dc2cc" },
-  pi: { tokens: 6132, sha256: "6bb240faba369b5568b2baa1a82c41808007653c2cea3588917d6753a8df9a81" },
-  openai: { tokens: 5822, sha256: "5f7e61514826505830fd10a511f360a42c6f1fa70982471036d79f7f401aba18" },
+  // says what `false` does without overstating it: one boolean on each tool,
+  // and a single clause on the create tool only — naming the todo-status
+  // trigger filter that honours it, since a Workflow without that filter does
+  // not — while the dispatch tool's boolean rides on it. That is 30 tokens,
+  // and — as every paragraph above records — there is no dead prose left on
+  // this surface to buy them back with, so the ceiling moves by exactly that
+  // and Pi sits ON it again. The next addition to this surface has to buy its
+  // room before it spends any.
+  rpc: { tokens: 5612, sha256: "a2f7e870afed166c0fadbac232e80998024b0da9cae28fa0381f185e69c09acc" },
+  pi: { tokens: 6133, sha256: "ddda5517109dcd25664347e4ac077648914e79a7f1a0abedd0927888f98eed28" },
+  openai: { tokens: 5823, sha256: "5fae3189663d9a9ed1d2e70da6896dad193c69d55b51cb4e88acc69187509739" },
 } as const;
 
 type TokenizerLoader = () => Promise<[{ Tiktoken: typeof import("js-tiktoken/lite").Tiktoken }, { default: typeof import("js-tiktoken/ranks/o200k_base").default }]>;

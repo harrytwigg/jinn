@@ -79,14 +79,29 @@ describe("createWorkItemIdempotent", () => {
   it("counts the labels a create asked for, but not the order they arrived in", () => {
     const key = "connector:slack:msg-9003";
     const input = { title: "tagged create", source: "connector" as const };
-    const first = idempotency.createWorkItemIdempotent(input, key, ["urgent", "billing"]);
+    const first = idempotency.createWorkItemIdempotent(input, key, { labels: ["urgent", "billing"] });
 
-    expect(() => idempotency.createWorkItemIdempotent(input, key, ["billing"]))
+    expect(() => idempotency.createWorkItemIdempotent(input, key, { labels: ["billing"] }))
       .toThrow(idempotency.WorkItemCreateIdempotencyConflictError);
     // A label set is a set: the same names in another order is the same create.
-    const reordered = idempotency.createWorkItemIdempotent(input, key, ["billing", "urgent"]);
+    const reordered = idempotency.createWorkItemIdempotent(input, key, { labels: ["billing", "urgent"] });
     expect(reordered.replayed).toBe(true);
     expect(reordered.item.id).toBe(first.item.id);
+  });
+
+  it("counts the auto-start opt-out, and only the opt-out, so pre-existing receipts still replay", () => {
+    const key = "connector:slack:msg-9004";
+    const input = { title: "opt-out create", source: "connector" as const };
+    const first = idempotency.createWorkItemIdempotent(input, key);
+
+    // A retry that flips the flag would leave the Todo auto-starting with no
+    // sign anything was asked for; it has to be refused like a flipped label set.
+    expect(() => idempotency.createWorkItemIdempotent(input, key, { autoStart: false }))
+      .toThrow(idempotency.WorkItemCreateIdempotencyConflictError);
+    // `true` is what absence means, so saying it is not a different create.
+    const explicit = idempotency.createWorkItemIdempotent(input, key, { autoStart: true });
+    expect(explicit.replayed).toBe(true);
+    expect(explicit.item.id).toBe(first.item.id);
   });
 
   it("leaves keyless creates alone: two identical ones are two Todos", () => {

@@ -228,7 +228,7 @@ export function buildWorkItemTools(): JinnMcpTool[] {
         dueAt: { type: "string" },
         labels: { type: "array", items: { type: "string" } },
         idempotencyKey: { type: "string" },
-        autoStart: { type: "boolean", description: "false: no Workflow auto-starts it on assignment." },
+        autoStart: { type: "boolean", description: "false: todo-status triggers filtering on autoStart skip it." },
       },
       required: ["title"],
     },

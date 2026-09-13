@@ -2376,7 +2376,7 @@ export async function handleApiRequest(
         // the whole request rather than leave an untagged Todo behind.
         let labels: Label[] | undefined;
         const create = () => idempotencyKey
-          ? createWorkItemIdempotent(input, idempotencyKey, labelRefs)
+          ? createWorkItemIdempotent(input, idempotencyKey, { labels: labelRefs, ...(autoStartOptOut ? { autoStart: false } : {}) })
           : { item: createWorkItem(input), replayed: false };
         const created = labelRefs === undefined && !autoStartOptOut
           ? create()

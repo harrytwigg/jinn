@@ -43,7 +43,17 @@ const CREATE_FINGERPRINT_FIELDS: ReadonlyArray<keyof CreateWorkItemInput> = [
   'dueAt', 'priority', 'source', 'sourceRef', 'acceptance', 'verifyPolicy', 'budgetUsd',
 ];
 
-function canonicalCreateFingerprint(input: CreateWorkItemInput, labels: readonly string[] | undefined): string {
+/** What a create asks for beyond the row itself: applied after the row rather
+ *  than through `CreateWorkItemInput`, but part of the request all the same. */
+export interface CreateWorkItemExtras {
+  labels?: readonly string[];
+  /** GEN-67: the auto-start opt-out. Only `false` is ever written, so only
+   *  `false` is fingerprinted — every receipt minted before the flag existed
+   *  stays byte-identical, and a retry that flips it reads as a conflict. */
+  autoStart?: boolean;
+}
+
+function canonicalCreateFingerprint(input: CreateWorkItemInput, { labels, autoStart }: CreateWorkItemExtras): string {
   const payload: Record<string, unknown> = {};
   for (const key of CREATE_FINGERPRINT_FIELDS) {
     if (input[key] !== undefined) payload[key] = input[key];
@@ -54,6 +64,7 @@ function canonicalCreateFingerprint(input: CreateWorkItemInput, labels: readonly
   // replay could deliver. Sorted, because a label set is a set: reordering the
   // same names is the same request and must not read as a conflict.
   if (labels !== undefined) payload.labels = [...labels].sort();
+  if (autoStart === false) payload.autoStart = false;
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
@@ -66,11 +77,11 @@ function canonicalCreateFingerprint(input: CreateWorkItemInput, labels: readonly
 export function createWorkItemIdempotent(
   input: CreateWorkItemInput,
   idempotencyKey: string,
-  labels?: readonly string[],
+  extras: CreateWorkItemExtras = {},
 ): IdempotentCreateResult {
   const db = initDb();
   const keyDigest = createHash('sha256').update(idempotencyKey).digest('hex');
-  const fingerprint = canonicalCreateFingerprint(input, labels);
+  const fingerprint = canonicalCreateFingerprint(input, extras);
 
   const txn = db.transaction((): IdempotentCreateResult => {
     const receipt = db
