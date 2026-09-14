@@ -7,6 +7,14 @@ cites nothing here and no stated requirement.
 Jinn is a pnpm + turbo monorepo: a gateway daemon and CLI (`packages/jinn`), a React web
 dashboard (`packages/web`), and a shared event contract (`packages/gateway-events`).
 
+**This is a permanent fork. Nothing here goes back upstream.** `harrytwigg/jinn` diverges from
+`hristo2612/jinn` on purpose and forever: there is no upstreaming plan and no eventual pull
+request. The `upstream` remote is read-only — a source of changes to merge *in*, never a push
+or pull-request target. Divergence from upstream is therefore not a defect and not a finding.
+Do not argue a change down to what upstream would accept; argue it against the rules below.
+The full statement is [`.specify/memory/constitution.md`](.specify/memory/constitution.md),
+Principle I.
+
 **This repository is public and publishes to npm.** Everything under `packages/**` reaches
 strangers, including `packages/jinn/template/**` (the files that seed a new user's instance
 home) and test files (they compile into `dist/` and ship in the tarball). No real names,
