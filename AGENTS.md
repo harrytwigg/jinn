@@ -12,8 +12,10 @@ dashboard (`packages/web`), and a shared event contract (`packages/gateway-event
 request. The `upstream` remote is read-only — a source of changes to merge *in*, never a push
 or pull-request target. Divergence from upstream is therefore not a defect and not a finding.
 Do not argue a change down to what upstream would accept; argue it against the rules below.
-The full statement is [`.specify/memory/constitution.md`](.specify/memory/constitution.md),
-Principle I.
+What it is aimed at instead is Principle II: an org that operates itself — work that starts
+without a human starting it, and capacity spent by the system rather than watched by the
+operator. The full statement of both is
+[`.specify/memory/constitution.md`](.specify/memory/constitution.md).
 
 **This repository is public and publishes to npm.** Everything under `packages/**` reaches
 strangers, including `packages/jinn/template/**` (the files that seed a new user's instance
